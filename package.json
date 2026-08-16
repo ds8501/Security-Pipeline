@@ -1,0 +1,13 @@
+{
+  "name": "security-pipeline-demo",
+  "version": "1.0.0",
+  "description": "Local prototype for the automated security pipeline demo",
+  "main": "scanner-service/server.js",
+  "scripts": {
+    "start": "node scanner-service/server.js",
+    "dev": "node scanner-service/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
