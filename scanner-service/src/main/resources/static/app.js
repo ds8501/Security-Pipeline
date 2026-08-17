@@ -1,5 +1,6 @@
 const API_BASE = '/api';
 const form = document.getElementById('scan-form');
+const stopScanButton = document.getElementById('stop-scan-btn');
 const repoUrlInput = document.getElementById('repoUrl');
 const branchInput = document.getElementById('branch');
 const statusLog = document.getElementById('status-log');
@@ -12,16 +13,59 @@ let poller = null;
 function badgeClass(verdict) {
   if (!verdict || verdict === 'PENDING') return 'pending';
   if (verdict === 'PASS') return 'pass';
+  if (verdict === 'CANCELLED') return 'pending';
   return 'blocked';
 }
 
+function renderStopButton(scan) {
+  const shouldShow = scan && ['queued', 'running', 'pending'].includes((scan.status || '').toLowerCase());
+  stopScanButton.hidden = !shouldShow;
+  stopScanButton.disabled = !shouldShow;
+}
+
+
 function renderStatus(logEntries) {
   statusLog.innerHTML = '';
+  const checklist = document.createElement('div');
+  checklist.className = 'checklist';
+
+  // Deduplicate checks: keep only the latest status for each check name
+  const checkMap = {};
   (logEntries || []).forEach((entry) => {
-    const item = document.createElement('li');
-    item.textContent = entry;
-    statusLog.appendChild(item);
+    const match = /^(.*?):\s*(PENDING|PASS|FAIL|ERROR)\s*(?:-\s*(.*))?$/i.exec(entry);
+    if (match) {
+      const name = match[1].trim();
+      const status = match[2].toUpperCase();
+      const details = (match[3] || '').trim();
+      checkMap[name] = { status, details };
+    }
   });
+
+  // Render deduplicated checks in order they first appeared
+  Object.entries(checkMap).forEach(([name, { status, details }]) => {
+    const row = document.createElement('div');
+    row.className = 'check-row';
+
+    const nameEl = document.createElement('div');
+    nameEl.className = 'check-name';
+    nameEl.textContent = name;
+
+    const statusEl = document.createElement('span');
+    const normalizedStatus = status === 'FAIL' ? 'fail' : status.toLowerCase();
+    statusEl.className = `status-pill ${normalizedStatus}`;
+    statusEl.textContent = status;
+
+    const detailEl = document.createElement('div');
+    detailEl.className = 'check-detail';
+    detailEl.textContent = details || 'Check updated';
+
+    row.appendChild(nameEl);
+    row.appendChild(statusEl);
+    row.appendChild(detailEl);
+    checklist.appendChild(row);
+  });
+
+  statusLog.appendChild(checklist);
 }
 
 function renderScanTable(scans) {
@@ -93,6 +137,7 @@ async function loadScans() {
   }
 
   const selected = scans.find((scan) => scan.id === selectedScanId) || scans[0];
+  renderStopButton(selected);
   populateDetail(selected);
 }
 
@@ -101,9 +146,16 @@ async function pollScan(scanId) {
 
   poller = setInterval(async () => {
     const response = await fetch(`${API_BASE}/scans/${scanId}`);
+    if (!response.ok) {
+      // If the scan is gone (e.g., server restarted) refresh the list and stop polling
+      clearInterval(poller);
+      poller = null;
+      await loadScans();
+      return;
+    }
     const scan = await response.json();
 
-    if (scan.status === 'passed' || scan.status === 'blocked') {
+    if (['passed', 'blocked', 'cancelled', 'error'].includes(scan.status)) {
       clearInterval(poller);
       poller = null;
     }
@@ -111,9 +163,22 @@ async function pollScan(scanId) {
     renderStatus(scan.log || []);
     await loadScans();
     selectedScanId = scan.id;
+    renderStopButton(scan);
     populateDetail(scan);
   }, 1200);
 }
+
+stopScanButton.addEventListener('click', async () => {
+  if (!selectedScanId) return;
+
+  const response = await fetch(`${API_BASE}/scans/${selectedScanId}/cancel`, { method: 'POST' });
+  const scan = await response.json();
+  renderStatus(scan.log || ['Scan cancelled.']);
+  selectedScanId = scan.id;
+  renderStopButton(scan);
+  await loadScans();
+  populateDetail(scan);
+});
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -138,6 +203,7 @@ form.addEventListener('submit', async (event) => {
   const scan = await response.json();
   renderStatus(scan.log || ['Scan requested.']);
   selectedScanId = scan.id;
+  renderStopButton(scan);
   await loadScans();
   pollScan(scan.id);
 });

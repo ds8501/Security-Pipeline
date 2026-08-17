@@ -46,6 +46,12 @@ public class ReviewService {
                 "<repository_content>\n" + repositoryContent + "\n</repository_content>";
 
         JsonNode root = claudeClient.completeJson(system, user, 2200);
+        
+        // Retry on parse error if the result contains an error field
+        if (root != null && root.isObject() && root.has("error") && "unparseable".equals(root.get("error").asText())) {
+            root = claudeClient.completeJson(system, user, 2200);
+        }
+        
         JsonNode issues = root;
         if (root != null && root.isObject() && root.has("findings")) {
             issues = root.get("findings");

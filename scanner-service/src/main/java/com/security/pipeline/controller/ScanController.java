@@ -33,12 +33,22 @@ public class ScanController {
     }
 
     @GetMapping("/scans/{id}")
-    public Scan getScan(@PathVariable Long id) {
-        return scanService.getScan(id);
+    public ResponseEntity<Scan> getScan(@PathVariable Long id) {
+        try {
+            Scan scan = scanService.getScan(id);
+            return ResponseEntity.ok(scan);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.status(404).build();
+        }
     }
 
     @PostMapping("/scans")
     public ResponseEntity<Scan> createScan(@Valid @RequestBody ScanRequest request) {
         return ResponseEntity.accepted().body(scanService.createScan(request.repoUrl(), request.branch(), request.baseBranchOrDefault()));
+    }
+
+    @PostMapping("/scans/{id}/cancel")
+    public Scan cancelScan(@PathVariable Long id) {
+        return scanService.cancelScan(id);
     }
 }
