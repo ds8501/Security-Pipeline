@@ -39,6 +39,6 @@ public class ScanController {
 
     @PostMapping("/scans")
     public ResponseEntity<Scan> createScan(@Valid @RequestBody ScanRequest request) {
-        return ResponseEntity.accepted().body(scanService.createScan(request.repoUrl(), request.branch()));
+        return ResponseEntity.accepted().body(scanService.createScan(request.repoUrl(), request.branch(), request.baseBranchOrDefault()));
     }
 }

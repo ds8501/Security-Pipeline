@@ -26,20 +26,23 @@ public class Finding {
     @Column(nullable = false)
     private String file;
 
-    @Column(nullable = false)
     private Integer line;
 
-    @Column(nullable = false, length = 2000)
+    @Column(length = 4000)
     private String description;
 
-    @Column(nullable = false, length = 2000)
+    @Column(length = 4000)
     private String proof;
 
-    @Column(nullable = false, length = 2000)
+    @Column(length = 4000)
     private String fix;
 
-    @Column(nullable = false)
     private String cwe;
+
+    private String owasp;
+
+    @Column(nullable = false)
+    private String proofStatus = "UNPROVEN";
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "scan_id", nullable = false)
@@ -115,6 +118,22 @@ public class Finding {
 
     public void setCwe(String cwe) {
         this.cwe = cwe;
+    }
+
+    public String getOwasp() {
+        return owasp;
+    }
+
+    public void setOwasp(String owasp) {
+        this.owasp = owasp;
+    }
+
+    public String getProofStatus() {
+        return proofStatus;
+    }
+
+    public void setProofStatus(String proofStatus) {
+        this.proofStatus = proofStatus;
     }
 
     public Scan getScan() {

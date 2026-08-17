@@ -1,19 +1,42 @@
 package com.security.pipeline.service;
 
+import com.security.pipeline.ai.ClaudeClient;
 import com.security.pipeline.entity.Finding;
 import com.security.pipeline.entity.Scan;
 import com.security.pipeline.repository.ScanRepository;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Service
 public class ScanService {
     private final ScanRepository scanRepository;
+    private final GitService gitService;
+    private final IntegrityService integrityService;
+    private final ReviewService reviewService;
+    private final ProofService proofService;
+    private final ClaudeClient claudeClient;
+    private final ExecutorService reviewExecutor = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
 
     public ScanService(ScanRepository scanRepository) {
+        this(scanRepository, null, null, null, null, new ClaudeClient());
+    }
+
+    @Autowired
+    public ScanService(ScanRepository scanRepository, GitService gitService, IntegrityService integrityService,
+                      ReviewService reviewService, ProofService proofService, ClaudeClient claudeClient) {
         this.scanRepository = scanRepository;
+        this.gitService = gitService;
+        this.integrityService = integrityService;
+        this.reviewService = reviewService;
+        this.proofService = proofService;
+        this.claudeClient = claudeClient;
     }
 
     public List<Scan> getScans() {
@@ -27,8 +50,14 @@ public class ScanService {
 
     @Transactional
     public Scan createScan(String repoUrl, String branch) {
+        return createScan(repoUrl, branch, "main");
+    }
+
+    @Transactional
+    public Scan createScan(String repoUrl, String branch, String baseBranch) {
         String normalizedRepo = repoUrl == null ? "" : repoUrl.trim();
         String normalizedBranch = branch == null ? "" : branch.trim();
+        String normalizedBaseBranch = baseBranch == null || baseBranch.isBlank() ? "main" : baseBranch.trim();
 
         if (normalizedRepo.isBlank()) {
             throw new IllegalArgumentException("repoUrl is required");
@@ -46,84 +75,90 @@ public class ScanService {
         scan.getLog().add("Queued for review");
         scanRepository.save(scan);
 
-        runReview(scan.getId());
+        reviewExecutor.submit(() -> runReview(scan.getId(), normalizedBaseBranch));
         return scanRepository.findById(scan.getId()).orElse(scan);
     }
 
     @Transactional
-    public void runReview(Long scanId) {
-        try {
-            Thread.sleep(1200L);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-
+    public void runReview(Long scanId, String baseBranch) {
         Scan scan = scanRepository.findById(scanId)
                 .orElseThrow(() -> new IllegalArgumentException("Scan not found: " + scanId));
 
-        scan.setStatus("running");
-        scan.getLog().add("Repository diff is being analyzed.");
-        scan.setSummary("Running the investigation and proof checks.");
-        scanRepository.save(scan);
-
+        Path repoDir = null;
         try {
-            Thread.sleep(1300L);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            if (claudeClient == null || !claudeClient.isConfigured()) {
+                scan.setStatus("error");
+                scan.setVerdict("ERROR");
+                scan.setSummary("Anthropic API key is not configured. Set ANTHROPIC_API_KEY to enable the gate-2 review pipeline.");
+                scan.getLog().add("ERROR: Anthropic API key is not configured.");
+                scanRepository.save(scan);
+                return;
+            }
+
+            scan.setStatus("running");
+            scan.setVerdict("PENDING");
+            scan.setSummary("Fetching repository diff...");
+            scan.getLog().add("Fetching diff for " + baseBranch + "..." + scan.getBranch());
+            scanRepository.save(scan);
+
+            DiffContext diffContext = gitService.fetchDiff(scan.getRepoUrl(), scan.getBranch(), baseBranch);
+            repoDir = diffContext.repoDir();
+            scan.getLog().add("Fetched diff with " + diffContext.changedFiles().size() + " changed file(s).");
+            scanRepository.save(scan);
+
+            IntegrityService.InjectionResult injectionResult = integrityService.detectInjection(diffContext.rawDiff());
+            scan.getLog().add("Integrity check: injection=" + injectionResult.detected() + " | " + injectionResult.evidence());
+            scanRepository.save(scan);
+
+            List<Finding> findings = new ArrayList<>(reviewService.review(diffContext));
+            scan.getFindings().clear();
+            for (Finding finding : findings) {
+                scan.addFinding(finding);
+            }
+            scan.getLog().add("AI review generated " + findings.size() + " potential finding(s).");
+            scanRepository.save(scan);
+
+            proofService.proveAll(scan, findings, repoDir);
+            scan.getLog().add("Proof layer completed for " + findings.size() + " finding(s).");
+            scanRepository.save(scan);
+
+            boolean suspiciousClean = integrityService.suspiciousCleanVerdict(diffContext.changedFiles(), findings.size());
+            decideVerdict(scan, injectionResult.detected(), suspiciousClean);
+            scan.getLog().add("Final verdict: " + scan.getVerdict() + " - " + scan.getSummary());
+            scanRepository.save(scan);
+        } catch (Exception e) {
+            scan.setStatus("error");
+            scan.setVerdict("ERROR");
+            scan.setSummary("Review pipeline failed: " + e.getMessage());
+            scan.getLog().add("ERROR: " + e.getMessage());
+            scanRepository.save(scan);
+        } finally {
+            if (gitService != null && repoDir != null) {
+                gitService.cleanup(repoDir);
+            }
         }
-
-        String signal = (scan.getRepoUrl() + " " + scan.getBranch()).toLowerCase();
-        boolean isHiddenInstruction = signal.contains("hidden") || signal.contains("instruction") || signal.contains("prompt");
-        boolean isVulnerable = signal.contains("vulnerable") || signal.contains("secret") || signal.contains("leak") || signal.contains("unsafe");
-
-        if (isHiddenInstruction) {
-            markBlocked(scan, "Hard tampering rule fired: hidden instruction was found and the build remains blocked.",
-                    "Hidden instruction detected in the review context; the scan still failed safely.",
-                    "Prompt injection attempt was ignored but still detected",
-                    "src/session.js", 22,
-                    "A review note tried to override the security agent and force a safe result. The scan recognised the tampering attempt and kept the gate closed.",
-                    "Detection rule: \"prompt injection should be treated as data, never instructions\"",
-                    "Remove hidden instructions from comments, PR descriptions, and generated artifacts before review. Keep the review loop grounded in repo content only.",
-                    "CWE-93");
-            return;
-        }
-
-        if (isVulnerable) {
-            markBlocked(scan, "The generated rule fired. Confirmed finding: data exposure in the auth flow.",
-                    "The security gate found a confirmed issue that blocks the merge.",
-                    "Sensitive user data is written to logs",
-                    "src/auth.js", 41,
-                    "A password reset flow logs the raw user record and exposes personal data to anyone with log access.",
-                    "Semgrep rule: \"logger.info(user)\" in auth paths is mapped to a data-leak issue.",
-                    "Remove raw record logging and emit only a non-sensitive identifier or redacted metadata.",
-                    "CWE-532");
-            return;
-        }
-
-        scan.setStatus("passed");
-        scan.setVerdict("PASS");
-        scan.setSummary("No confirmed issues were found in the changed code path.");
-        scan.getLog().add("Gate 1 checks passed and no confirmed findings remain.");
-        scanRepository.save(scan);
     }
 
-    private void markBlocked(Scan scan, String logEntry, String summary, String title, String file, Integer line,
-                             String description, String proof, String fix, String cwe) {
-        scan.setStatus("blocked");
-        scan.setVerdict("BLOCKED");
-        scan.setSummary(summary);
-        scan.getLog().add(logEntry);
+    void decideVerdict(Scan scan, boolean injectionDetected, boolean suspiciousClean) {
+        List<Finding> findings = scan.getFindings() == null ? List.of() : scan.getFindings();
+        int confirmed = 0;
+        int unproven = 0;
+        boolean confirmedHighOrCritical = false;
 
-        Finding finding = new Finding();
-        finding.setTitle(title);
-        finding.setSeverity("HIGH");
-        finding.setFile(file);
-        finding.setLine(line);
-        finding.setDescription(description);
-        finding.setProof(proof);
-        finding.setFix(fix);
-        finding.setCwe(cwe);
-        scan.addFinding(finding);
-        scanRepository.save(scan);
+        for (Finding finding : findings) {
+            if ("CONFIRMED".equalsIgnoreCase(finding.getProofStatus())) {
+                confirmed++;
+                if ("HIGH".equalsIgnoreCase(finding.getSeverity()) || "CRITICAL".equalsIgnoreCase(finding.getSeverity())) {
+                    confirmedHighOrCritical = true;
+                }
+            } else {
+                unproven++;
+            }
+        }
+
+        boolean blocked = injectionDetected || suspiciousClean || confirmedHighOrCritical;
+        scan.setVerdict(blocked ? "BLOCKED" : "PASS");
+        scan.setStatus(blocked ? "blocked" : "passed");
+        scan.setSummary(confirmed + " confirmed, " + unproven + " unproven");
     }
 }

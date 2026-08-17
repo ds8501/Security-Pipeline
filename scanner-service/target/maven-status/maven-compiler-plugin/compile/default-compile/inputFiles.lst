@@ -1,7 +1,0 @@
-/Users/divya.singh/.copilot/repos/copilot-worktrees/Security-Pipeline/divyasingh-coder-fictional-guide/scanner-service/src/main/java/com/security/pipeline/ScannerServiceApplication.java
-/Users/divya.singh/.copilot/repos/copilot-worktrees/Security-Pipeline/divyasingh-coder-fictional-guide/scanner-service/src/main/java/com/security/pipeline/controller/ScanController.java
-/Users/divya.singh/.copilot/repos/copilot-worktrees/Security-Pipeline/divyasingh-coder-fictional-guide/scanner-service/src/main/java/com/security/pipeline/controller/ScanRequest.java
-/Users/divya.singh/.copilot/repos/copilot-worktrees/Security-Pipeline/divyasingh-coder-fictional-guide/scanner-service/src/main/java/com/security/pipeline/entity/Finding.java
-/Users/divya.singh/.copilot/repos/copilot-worktrees/Security-Pipeline/divyasingh-coder-fictional-guide/scanner-service/src/main/java/com/security/pipeline/entity/Scan.java
-/Users/divya.singh/.copilot/repos/copilot-worktrees/Security-Pipeline/divyasingh-coder-fictional-guide/scanner-service/src/main/java/com/security/pipeline/repository/ScanRepository.java
-/Users/divya.singh/.copilot/repos/copilot-worktrees/Security-Pipeline/divyasingh-coder-fictional-guide/scanner-service/src/main/java/com/security/pipeline/service/ScanService.java
