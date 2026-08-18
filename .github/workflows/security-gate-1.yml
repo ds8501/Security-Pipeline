@@ -1,85 +1,403 @@
 name: Security Pipeline Gate 1
 
+# Gate 1 — runs on every push to a branch and on PRs to main.
+# "Is this code safe and stable enough to merge?" Target: under 5 minutes (jobs run in parallel).
+#
+# Policy: BLOCK ON EVERYTHING. Any finding from any tool fails the build. Every scanner also
+# uploads SARIF to the GitHub Security tab (Code scanning) so each issue shows file, line, and fix.
+#
+# Checks -> tools:
+#   Unit tests + coverage        -> JUnit + JaCoCo + diff-cover
+#   Code sanity & crypto misuse  -> Semgrep
+#   Secret leak                  -> Gitleaks
+#   Vulnerable dependencies      -> osv-scanner (Maven pom.xml + npm package-lock.json)
+#   Infra / container config     -> Trivy config (Docker/K8s/IaC; no-op until such files exist)
+#   Software bill of materials   -> Syft (CycloneDX)
+#   Pipeline hardening           -> zizmor + actionlint
+#   Live AI review               -> the real ScanService pipeline via POST /api/scans
+#
+# The ai-pipeline-review job needs an LLM_API_KEY repo secret (Settings -> Secrets -> Actions);
+# without it that one job self-skips (stays green).
+
 on:
+  push:
+    branches: ['**']
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
+  workflow_dispatch: {}
+
+# Least privilege by default; SARIF-uploading jobs opt into security-events: write individually.
+permissions:
+  contents: read
+
+concurrency:
+  group: gate1-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  security-gate:
+  # ---------------------------------------------------------------- Unit tests + coverage
+  tests:
     runs-on: ubuntu-latest
-    name: Security Gate 1 - Tests & Scanning
-    
+    name: Unit tests & coverage
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          java-version: '17'
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          java-version: '21'
           distribution: 'temurin'
           cache: maven
 
-      - name: Run Maven tests
+      - name: Run tests with coverage
         working-directory: ./scanner-service
-        run: mvn test
+        # Surefire runs ScanServiceTest / ScanPersistenceIntegrationTest / ClaudeClientTest;
+        # JaCoCo produces target/site/jacoco/* and fails if total coverage drops below the pom floor.
+        run: mvn -B test
 
-      - name: Install Semgrep
+      - name: Diff coverage gate (changed lines)
+        working-directory: ./scanner-service
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          pip install semgrep
+          BASE="${BASE_REF:-main}"
+          git fetch --no-tags origin "${BASE}:refs/remotes/origin/${BASE}" || true
+          python3 -m pip install --quiet diff-cover
+          diff-cover target/site/jacoco/jacoco.xml \
+            --compare-branch="origin/${BASE}" \
+            --fail-under=80
 
-      - name: Semgrep scan
-        run: |
-          semgrep --config=p/security-audit \
-            --json \
-            --output=semgrep-results.json \
-            scanner-service/src/main/java || true
-
-      - name: Gitleaks secret scan
-        run: |
-          docker run --rm -v $(pwd):/repo zricethezav/gitleaks:latest detect --source /repo --report-path /repo/gitleaks-results.json --exit-code 0 || true
-
-      - name: Upload scan results
-        uses: actions/upload-artifact@v3
+      - name: Upload test & coverage reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: scan-results
+          name: test-and-coverage-reports
           path: |
-            semgrep-results.json
-            gitleaks-results.json
+            scanner-service/target/surefire-reports/**
+            scanner-service/target/site/jacoco/**
+          if-no-files-found: warn
 
-      - name: Fail on critical findings
-        run: |
-          if [ -f semgrep-results.json ]; then
-            CRITICAL_COUNT=$(jq '.results | map(select(.extra.severity == "ERROR")) | length' semgrep-results.json || echo 0)
-            if [ "$CRITICAL_COUNT" -gt 0 ]; then
-              echo "❌ Found $CRITICAL_COUNT critical Semgrep issues"
-              exit 1
-            fi
-          fi
-
-  build-service:
+  # ---------------------------------------------------------------- Build the runnable jar
+  build:
     runs-on: ubuntu-latest
-    name: Build Service
-
+    name: Build service
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          java-version: '17'
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          java-version: '21'
           distribution: 'temurin'
           cache: maven
 
       - name: Build scanner-service
         working-directory: ./scanner-service
-        run: mvn clean package -DskipTests
+        run: mvn -B clean package -DskipTests
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v3
+      - name: Upload jar
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: scanner-service-jar
           path: scanner-service/target/*.jar
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Code sanity & crypto misuse
+  sast:
+    runs-on: ubuntu-latest
+    name: Code sanity & crypto (Semgrep)
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run Semgrep
+        run: |
+          python3 -m pip install --quiet semgrep
+          semgrep scan \
+            --config p/security-audit \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --sarif --output semgrep.sarif \
+            --metrics off
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f3712979fa5f215279b101dd0a2e3bdfb4353324 # v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Block on findings
+        run: |
+          COUNT=$(jq '[.runs[].results[]] | length' semgrep.sarif)
+          echo "Semgrep findings: ${COUNT}"
+          if [ "${COUNT}" -gt 0 ]; then
+            echo "::error::Semgrep found ${COUNT} issue(s) — see the Security tab."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- Secret leak
+  secrets:
+    runs-on: ubuntu-latest
+    name: Secret leak (Gitleaks)
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run Gitleaks
+        run: |
+          docker run --rm -v "${PWD}:/repo" ghcr.io/gitleaks/gitleaks:latest \
+            detect --source=/repo \
+            --report-format=sarif --report-path=/repo/gitleaks.sarif \
+            --redact --exit-code=0
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f3712979fa5f215279b101dd0a2e3bdfb4353324 # v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Block on findings
+        run: |
+          COUNT=$(jq '[.runs[].results[]] | length' gitleaks.sarif)
+          echo "Gitleaks findings: ${COUNT}"
+          if [ "${COUNT}" -gt 0 ]; then
+            echo "::error::Gitleaks found ${COUNT} secret(s) — see the Security tab."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- Vulnerable dependencies
+  # Google-maintained reusable workflow: scans pom.xml + package-lock.json, uploads SARIF,
+  # and fails the run when a known-vulnerable dependency is present.
+  deps:
+    name: Vulnerable dependencies (osv-scanner)
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: google/osv-scanner/.github/workflows/osv-scanner-reusable.yml@c84fa4568f2526d0333e9a914ea8a0a5f74ad68b # v2.5.1
+
+  # ---------------------------------------------------------------- Infra / container config
+  infra:
+    runs-on: ubuntu-latest
+    name: Infra & container config (Trivy)
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Trivy config scan
+        run: |
+          trivy config . \
+            --format sarif --output trivy.sarif \
+            --severity CRITICAL,HIGH,MEDIUM --exit-code 0
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f3712979fa5f215279b101dd0a2e3bdfb4353324 # v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-config
+
+      - name: Block on findings
+        run: |
+          COUNT=$(jq '[.runs[].results[]] | length' trivy.sarif)
+          echo "Trivy misconfig findings: ${COUNT}"
+          if [ "${COUNT}" -gt 0 ]; then
+            echo "::error::Trivy found ${COUNT} misconfiguration(s) — see the Security tab."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- Software bill of materials
+  sbom:
+    runs-on: ubuntu-latest
+    name: SBOM (Syft)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------- Pipeline hardening
+  pipeline-hardening:
+    runs-on: ubuntu-latest
+    name: Pipeline hardening (zizmor + actionlint)
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m pip install --quiet zizmor
+          zizmor --format sarif --output zizmor.sarif .github/workflows || true
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@f3712979fa5f215279b101dd0a2e3bdfb4353324 # v3
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+      - name: Block on findings
+        run: |
+          COUNT=$(jq '[.runs[].results[]] | length' zizmor.sarif)
+          echo "zizmor findings: ${COUNT}"
+          if [ "${COUNT}" -gt 0 ]; then
+            echo "::error::zizmor found ${COUNT} workflow issue(s) — see the Security tab."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- Live AI review (kept)
+  ai-pipeline-review:
+    runs-on: ubuntu-latest
+    name: Live AI pipeline (POST /api/scans)
+    needs: build
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Install Semgrep
+        run: python3 -m pip install --quiet semgrep
+
+      - name: Download scanner-service jar
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: scanner-service-jar
+          path: app
+
+      - name: Run the security pipeline against this PR
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          SEMGREP_BINARY: semgrep
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -o pipefail
+
+          if [ -z "${LLM_API_KEY}" ]; then
+            echo "::notice::LLM_API_KEY secret not set — skipping the live AI pipeline. Add it under Settings → Secrets and variables → Actions to enable this gate."
+            exit 0
+          fi
+          if [ -z "${LLM_MODEL:-}" ]; then unset LLM_MODEL; fi
+
+          JAR=$(find app -name '*.jar' ! -name '*.jar.original' | head -1)
+          echo "Starting ${JAR}"
+          java -jar "${JAR}" > app.log 2>&1 &
+          APP_PID=$!
+
+          echo "Waiting for the service to come up..."
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:8080/api/health >/dev/null 2>&1; then echo "service up"; break; fi
+            if ! kill -0 "${APP_PID}" 2>/dev/null; then echo "::error::service exited during startup"; cat app.log; exit 1; fi
+            sleep 2
+          done
+
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+
+          ID=$(curl -s -X POST http://localhost:8080/api/scans \
+                 -H 'content-type: application/json' \
+                 -d "{\"repoUrl\":\"${REPO_URL}\",\"branch\":\"${HEAD_REF}\",\"baseBranch\":\"${BASE_REF}\"}" \
+               | jq -r '.id')
+          echo "Created scan id=${ID} for ${HEAD_REF}...${BASE_REF}"
+
+          STATUS="unknown"
+          RESULT="{}"
+          for _ in $(seq 1 150); do
+            RESULT=$(curl -s "http://localhost:8080/api/scans/${ID}")
+            STATUS=$(echo "${RESULT}" | jq -r '.status // "unknown"')
+            echo "  status=${STATUS}"
+            case "${STATUS}" in passed|blocked|error|cancelled) break;; esac
+            sleep 4
+          done
+
+          echo "----- pipeline log -----"
+          echo "${RESULT}" | jq -r '.log[]? // empty' | sed 's/^/  /'
+          echo "------------------------"
+          echo "${RESULT}" | jq '{status, verdict, summary, findings: (.findings | length)}'
+          echo "${RESULT}" | jq 'del(.repoUrl)' > scan-result.json
+
+          kill "${APP_PID}" 2>/dev/null || true
+
+          VERDICT=$(echo "${RESULT}" | jq -r '.verdict // "UNKNOWN"')
+          case "${VERDICT}" in
+            PASS)    echo "::notice::AI pipeline verdict: PASS" ;;
+            BLOCKED) echo "::error::AI pipeline BLOCKED this PR"; exit 1 ;;
+            *)       echo "::error::AI pipeline did not complete cleanly (verdict=${VERDICT}, status=${STATUS})."; exit 1 ;;
+          esac
+
+      - name: Upload pipeline result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ai-pipeline-scan-result
+          path: |
+            scan-result.json
+            app.log
+          if-no-files-found: warn
