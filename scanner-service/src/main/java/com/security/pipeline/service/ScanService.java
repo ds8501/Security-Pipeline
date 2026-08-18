@@ -110,12 +110,12 @@ public class ScanService {
 
             scan.setStatus("running");
             scan.setVerdict("PENDING");
-            scan.setSummary("Running security pipeline checks...");
-            appendCheck(scan, "Unit tests", "PENDING", "Waiting to start");
-            appendCheck(scan, "Integration tests", "PENDING", "Waiting for review results");
-            appendCheck(scan, "Security diff review", "PENDING", "Waiting to start");
-            appendCheck(scan, "Semgrep proof", "PENDING", "Waiting to start");
-            appendCheck(scan, "Final verdict", "PENDING", "Waiting for checks");
+            scan.setSummary("Running Gate 2 review pipeline...");
+            appendCheck(scan, "Fetch diff", "PENDING", "Waiting to start");
+            appendCheck(scan, "Injection check", "PENDING", "Waiting for diff");
+            appendCheck(scan, "AI review", "PENDING", "Waiting for diff");
+            appendCheck(scan, "Semgrep proof", "PENDING", "Waiting for findings");
+            appendCheck(scan, "Verdict", "PENDING", "Waiting for checks");
 
             if (isCancelled(scanId)) {
                 markCancelled(scan);
@@ -123,11 +123,11 @@ public class ScanService {
             }
 
             if (claudeClient == null || !claudeClient.isConfigured()) {
-                appendCheck(scan, "Unit tests", "FAIL", "LLM API key not configured");
-                appendCheck(scan, "Integration tests", "FAIL", "LLM API key not configured");
-                appendCheck(scan, "Security diff review", "FAIL", "LLM API key not configured");
+                appendCheck(scan, "Fetch diff", "FAIL", "LLM API key not configured");
+                appendCheck(scan, "Injection check", "FAIL", "LLM API key not configured");
+                appendCheck(scan, "AI review", "FAIL", "LLM API key not configured");
                 appendCheck(scan, "Semgrep proof", "FAIL", "LLM API key not configured");
-                appendCheck(scan, "Final verdict", "FAIL", "LLM API key not configured");
+                appendCheck(scan, "Verdict", "FAIL", "LLM API key not configured");
                 scan.setStatus("error");
                 scan.setVerdict("ERROR");
                 scan.setSummary("LLM API key is not configured. Set LLM_API_KEY environment variable to enable the Gate-2 review pipeline.");
@@ -135,7 +135,6 @@ public class ScanService {
                 return;
             }
 
-            appendCheck(scan, "Unit tests", "PASS", "Environment ready");
             scan.getLog().add("Fetching diff for " + baseBranch + "..." + scan.getBranch());
 
             if (isCancelled(scanId)) {
@@ -145,7 +144,7 @@ public class ScanService {
 
             DiffContext diffContext = gitService.fetchDiff(scan.getRepoUrl(), scan.getBranch(), baseBranch);
             repoDir = diffContext.repoDir();
-            appendCheck(scan, "Integration tests", "PASS", "Repository diff loaded successfully");
+            appendCheck(scan, "Fetch diff", "PASS", "Loaded " + diffContext.changedFiles().size() + " changed file(s)");
             scan.getLog().add("Fetched diff with " + diffContext.changedFiles().size() + " changed file(s).");
 
             if (isCancelled(scanId)) {
@@ -155,9 +154,9 @@ public class ScanService {
 
             IntegrityService.InjectionResult injectionResult = integrityService.detectInjection(diffContext.rawDiff());
             if (injectionResult.detected()) {
-                appendCheck(scan, "Security diff review", "FAIL", injectionResult.evidence());
+                appendCheck(scan, "Injection check", "FAIL", injectionResult.evidence());
             } else {
-                appendCheck(scan, "Security diff review", "PASS", "No prompt injection detected");
+                appendCheck(scan, "Injection check", "PASS", "No prompt injection detected");
             }
             scan.getLog().add("Integrity check: injection=" + injectionResult.detected() + " | " + injectionResult.evidence());
 
@@ -169,7 +168,7 @@ public class ScanService {
             List<Finding> reviewFindings = new ArrayList<>(reviewService.review(diffContext));
             int reviewCount = reviewFindings.size();
             scan.setFindings(reviewFindings);
-            appendCheck(scan, "Security diff review", "PASS", "AI review generated " + reviewCount + " potential finding(s)");
+            appendCheck(scan, "AI review", "PASS", "Generated " + reviewCount + " potential finding(s)");
             scan.getLog().add("AI review generated " + reviewCount + " potential finding(s).");
 
             if (isCancelled(scanId)) {
@@ -202,14 +201,13 @@ public class ScanService {
             boolean suspiciousClean = integrityService.suspiciousCleanVerdict(diffContext.changedFiles(), reviewCount);
             decideVerdict(scan, injectionResult.detected(), suspiciousClean);
             if ("BLOCKED".equals(scan.getVerdict())) {
-                appendCheck(scan, "Final verdict", "FAIL", scan.getSummary());
+                appendCheck(scan, "Verdict", "FAIL", scan.getSummary());
             } else {
-                appendCheck(scan, "Final verdict", "PASS", scan.getSummary());
+                appendCheck(scan, "Verdict", "PASS", scan.getSummary());
             }
             scan.getLog().add("Final verdict: " + scan.getVerdict() + " - " + scan.getSummary());
         } catch (Exception e) {
-            appendCheck(scan, "Unit tests", "FAIL", e.getMessage());
-            appendCheck(scan, "Integration tests", "FAIL", e.getMessage());
+            appendCheck(scan, "Verdict", "FAIL", e.getMessage());
             scan.setStatus("error");
             scan.setVerdict("ERROR");
             scan.setSummary("Review pipeline failed: " + e.getMessage());

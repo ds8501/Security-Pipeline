@@ -125,19 +125,39 @@ function donut(counts) {
     <span class="val">${r.v} (${Math.round(r.v / total * 100)}%)</span></li>`).join('');
 }
 function renderLastRun(scan) {
-  if (!scan) { $('last-run-id').textContent = ''; $('last-run-badge').textContent = '—'; donut({ pass: 0, fail: 0, skip: 0 }); return; }
+  const box = $('last-run-checks');
+  if (!scan) {
+    $('last-run-id').textContent = ''; $('last-run-badge').textContent = '—';
+    donut({ pass: 0, fail: 0, skip: 0 });
+    if (box) box.innerHTML = '<p class="empty">No run selected.</p>';
+    return;
+  }
   $('last-run-id').textContent = `#${scan.id}`;
   const b = verdictBadge(scan.verdict);
   const badge = $('last-run-badge');
   badge.className = `badge ${b.cls}`;
   badge.textContent = b.label;
-  const checks = Object.values(parseChecks(scan.log));
-  const counts = {
+
+  const checkMap = parseChecks(scan.log);
+  const checks = Object.values(checkMap);
+  donut({
     pass: checks.filter((c) => c.status === 'PASS').length,
     fail: checks.filter((c) => c.status === 'FAIL' || c.status === 'ERROR').length,
     skip: checks.filter((c) => c.status === 'PENDING').length,
-  };
-  donut(counts);
+  });
+
+  // Named Gate-2 pipeline stages (Unit tests / Integration tests / Security diff review / Semgrep proof / Final verdict)
+  if (box) {
+    const entries = Object.entries(checkMap);
+    box.innerHTML = entries.length ? entries.map(([name, c]) => {
+      const pill = c.status === 'PASS' ? 'pass' : (['FAIL', 'ERROR'].includes(c.status) ? 'fail' : 'pending');
+      return `<div class="check-row">
+        <div class="check-name">${name}</div>
+        <span class="status-pill ${pill}">${c.status}</span>
+        <div class="check-detail">${c.details || ''}</div>
+      </div>`;
+    }).join('') : '<p class="empty">Checks appear here once the scan starts.</p>';
+  }
 }
 
 /* ---------- failures + detail ---------- */
@@ -206,18 +226,57 @@ function pollScan(id) {
   }, 1500);
 }
 
-/* ---------- actions ---------- */
-$('scan-form').addEventListener('submit', async (e) => {
+/* ---------- run form (gate selector) ---------- */
+function selectedGate() { return $('gate-select').value; }
+function applyGateSelection() {
+  const g2 = selectedGate() === 'gate2';
+  document.querySelectorAll('.g2-field').forEach((el) => { el.hidden = !g2; });
+  document.querySelectorAll('.g1-field').forEach((el) => { el.hidden = g2; });
+  $('run-btn').textContent = g2 ? '▶ Run Gate 2' : '▶ Run Gate 1';
+  $('gate-desc').textContent = g2
+    ? 'Gate 2 — AI security review: injection check → AI review → Semgrep proof → verdict'
+    : 'Gate 1 — CI checks: tests, Semgrep, Gitleaks, osv-scanner, Trivy, SBOM (via GitHub Actions or local tools)';
+  if (!g2) $('stop-scan-btn').hidden = true;
+}
+$('gate-select').addEventListener('change', applyGateSelection);
+applyGateSelection();
+
+function repoInput() { return $('repo-input').value.trim(); }
+function branchInput() { return $('branch-input').value.trim(); }
+// Gate 2 clones a URL; accept "owner/name" too by expanding it to a GitHub URL.
+function toCloneUrl(v) {
+  if (!v) return '';
+  if (v.includes('://') || v.startsWith('git@')) return v;
+  return 'https://github.com/' + v.replace(/\.git$/, '') + '.git';
+}
+
+$('run-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const payload = { repoUrl: $('repoUrl').value, branch: $('branch').value, baseBranch: $('baseBranch').value };
-  const res = await fetch(`${API_BASE}/scans`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
-  });
-  if (!res.ok) return;
-  const scan = await res.json();
-  selectedScanId = scan.id;
-  await loadScans();
-  pollScan(scan.id);
+  if (selectedGate() === 'gate2') {
+    const payload = {
+      repoUrl: toCloneUrl(repoInput()),
+      branch: branchInput() || 'main',
+      baseBranch: $('baseBranch').value || 'main',
+    };
+    const res = await fetch(`${API_BASE}/scans`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    if (!res.ok) return;
+    const scan = await res.json();
+    selectedScanId = scan.id;
+    await loadScans();
+    pollScan(scan.id);
+  } else {
+    // Gate 1 accepts a URL or owner/name directly (backend normalizes it).
+    const payload = { mode: $('gate1-mode').value, repo: repoInput() || undefined, ref: branchInput() || undefined };
+    const res = await fetch(`${API_BASE}/gate1`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    const run = await res.json();
+    renderGate1(run);
+    pollGate1(run.id);
+    $('gate1-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 });
 $('stop-scan-btn').addEventListener('click', async () => {
   if (!selectedScanId) return;
@@ -230,10 +289,11 @@ $('view-report').addEventListener('click', () => $('failures').scrollIntoView({ 
 document.querySelectorAll('.nav-item').forEach((item) => item.addEventListener('click', () => {
   document.querySelectorAll('.nav-item').forEach((n) => n.classList.remove('active'));
   item.classList.add('active');
-  const map = { dashboard: 'main', new: 'new', runs: 'runs-body', gate1: 'gate1', failures: 'failures' };
+  const map = { dashboard: 'main', new: 'new', runs: 'runs-body', gate1: 'new', failures: 'failures' };
   const target = document.getElementById(map[item.dataset.nav]) || document.querySelector('.main');
   target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  if (item.dataset.nav === 'new') $('repoUrl').focus();
+  if (item.dataset.nav === 'new') { $('gate-select').value = 'gate2'; applyGateSelection(); $('repo-input').focus(); }
+  if (item.dataset.nav === 'gate1') { $('gate-select').value = 'gate1'; applyGateSelection(); }
 }));
 $('theme-toggle').addEventListener('click', () => {
   const cur = document.documentElement.getAttribute('data-theme') === 'dark' ? '' : 'dark';
@@ -251,6 +311,7 @@ function gate1Pill(c) {
   return { cls: 'pending', label: v };
 }
 function renderGate1(run) {
+  $('gate1-panel').hidden = false;
   const c = run.conclusion || 'PENDING';
   const cls = c === 'PASS' ? 'pass' : (c === 'PENDING' ? 'pending' : 'blocked');
   $('gate1-summary').innerHTML = `<span class="badge ${cls}">${c}</span> <span class="muted">mode=${run.mode || '—'} · ${run.summary || run.status || ''}</span>`;
@@ -274,15 +335,4 @@ function pollGate1(id) {
     if (['completed', 'error'].includes(run.status)) { clearInterval(gate1Poller); gate1Poller = null; }
   }, 2000);
 }
-$('gate1-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const payload = { mode: $('gate1-mode').value, repo: $('gate1-repo').value || undefined, ref: $('gate1-ref').value || undefined };
-  const res = await fetch(`${API_BASE}/gate1`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
-  });
-  const run = await res.json();
-  renderGate1(run);
-  pollGate1(run.id);
-});
-
 loadScans();
