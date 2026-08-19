@@ -10,7 +10,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class ScanServiceTest {
-    private final ScanService scanService = new ScanService(null, null, null, null, null, new ClaudeClient());
+    private final ScanService scanService = new ScanService(null, null, null, null, null, new ClaudeClient(), null);
     private final IntegrityService integrityService = new IntegrityService(new ClaudeClient());
 
     @Test

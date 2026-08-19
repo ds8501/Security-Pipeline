@@ -11,9 +11,11 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Provider-agnostic LLM client supporting both OpenAI-compatible APIs (Gemini, Groq, etc.)
@@ -21,35 +23,72 @@ import java.util.Map;
  */
 @Component
 public class ClaudeClient {
+    private static final String DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
+    private static final Set<String> ALLOWED_HOSTS = Set.of(
+            "generativelanguage.googleapis.com",
+            "api.anthropic.com",
+            "api.openai.com",
+            "api.groq.com"
+    );
+
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(20))
             .build();
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Value("${llm.base-url:https://generativelanguage.googleapis.com/v1beta/openai}")
+    @Value("${llm.base-url:}")
     private String baseUrl;
 
     @Value("${llm.api-key:}")
     private String apiKey;
 
-    @Value("${llm.model:gemini-2.5-flash}")
+    @Value("${llm.model:}")
     private String model;
 
+    @Value("${anthropic.base-url:}")
+    private String legacyBaseUrl;
+
+    @Value("${anthropic.api-key:}")
+    private String legacyApiKey;
+
+    @Value("${anthropic.model:}")
+    private String legacyModel;
+
     private boolean anthropicNative;
+    private String resolvedBaseUrl;
+    private String resolvedApiKey;
+    private String resolvedModel;
 
     public ClaudeClient() {
     }
 
     private void ensureInitialized() {
-        if (baseUrl == null) {
-            baseUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
+        if (resolvedBaseUrl != null) {
+            return;
         }
-        baseUrl = baseUrl.replaceAll("/$", "");
-        anthropicNative = baseUrl.contains("api.anthropic.com");
+
+        String configuredApiKey = firstNonBlank(apiKey, legacyApiKey);
+        String configuredModel = firstNonBlank(model, legacyModel);
+        boolean legacyAnthropic = isBlank(apiKey) && !isBlank(legacyApiKey);
+
+        String configuredBaseUrl = firstNonBlank(baseUrl, legacyBaseUrl);
+        if (configuredBaseUrl == null) {
+            configuredBaseUrl = legacyAnthropic ? "https://api.anthropic.com/v1" : DEFAULT_BASE_URL;
+        }
+
+        if (configuredModel == null) {
+            configuredModel = legacyAnthropic ? "claude-sonnet-5" : "gemini-2.5-flash";
+        }
+
+        resolvedBaseUrl = normalizeBaseUrl(configuredBaseUrl);
+        resolvedApiKey = configuredApiKey;
+        resolvedModel = configuredModel;
+        anthropicNative = URI.create(resolvedBaseUrl).getHost().equalsIgnoreCase("api.anthropic.com");
     }
 
     public boolean isConfigured() {
-        return apiKey != null && !apiKey.isBlank();
+        ensureInitialized();
+        return !isBlank(resolvedApiKey);
     }
 
     public String complete(String system, String user, int maxTokens) {
@@ -64,10 +103,10 @@ public class ClaudeClient {
 
             if (anthropicNative) {
                 json = buildAnthropicRequest(system, user, maxTokens);
-                endpoint = baseUrl + "/messages";
+                endpoint = resolvedBaseUrl + "/messages";
             } else {
                 json = buildOpenAIRequest(system, user, maxTokens);
-                endpoint = baseUrl + "/chat/completions";
+                endpoint = resolvedBaseUrl + "/chat/completions";
             }
 
             HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(URI.create(endpoint))
@@ -76,10 +115,10 @@ public class ClaudeClient {
                     .timeout(Duration.ofMinutes(3));
 
             if (anthropicNative) {
-                requestBuilder.header("x-api-key", apiKey)
+                requestBuilder.header("x-api-key", resolvedApiKey)
                         .header("anthropic-version", "2023-06-01");
             } else {
-                requestBuilder.header("authorization", "Bearer " + apiKey);
+                requestBuilder.header("authorization", "Bearer " + resolvedApiKey);
             }
 
             HttpRequest request = requestBuilder.build();
@@ -103,9 +142,29 @@ public class ClaudeClient {
         }
     }
 
+    static String normalizeBaseUrl(String configuredBaseUrl) {
+        URI uri = URI.create(configuredBaseUrl.trim());
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        if (scheme == null || host == null || !"https".equalsIgnoreCase(scheme)) {
+            throw new IllegalStateException("LLM base URL must be an HTTPS endpoint.");
+        }
+
+        String normalizedHost = host.toLowerCase(Locale.ROOT);
+        if (!ALLOWED_HOSTS.contains(normalizedHost)) {
+            throw new IllegalStateException("Unsupported LLM provider endpoint: " + normalizedHost);
+        }
+
+        String normalized = uri.toString();
+        while (normalized.endsWith("/")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
+    }
+
     private String buildOpenAIRequest(String system, String user, int maxTokens) throws IOException {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("model", model);
+        body.put("model", resolvedModel);
         body.put("max_tokens", Math.max(256, maxTokens));
         body.put("temperature", 0);
 
@@ -120,7 +179,7 @@ public class ClaudeClient {
 
     private String buildAnthropicRequest(String system, String user, int maxTokens) throws IOException {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("model", model);
+        body.put("model", resolvedModel);
         body.put("max_tokens", Math.max(256, maxTokens));
         body.put("system", system);
 
@@ -189,5 +248,19 @@ public class ClaudeClient {
 
     public ObjectMapper mapper() {
         return objectMapper;
+    }
+
+    private boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    private String firstNonBlank(String primary, String secondary) {
+        if (!isBlank(primary)) {
+            return primary;
+        }
+        if (!isBlank(secondary)) {
+            return secondary;
+        }
+        return null;
     }
 }

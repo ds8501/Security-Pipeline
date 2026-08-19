@@ -18,13 +18,15 @@ import java.util.List;
 @Service
 public class ProofService {
     private final ClaudeClient claudeClient;
+    private final SandboxService sandboxService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${secgate.semgrep-binary:semgrep}")
     private String semgrepBinary;
 
-    public ProofService(ClaudeClient claudeClient) {
+    public ProofService(ClaudeClient claudeClient, SandboxService sandboxService) {
         this.claudeClient = claudeClient;
+        this.sandboxService = sandboxService;
     }
 
     public void proveAll(Scan scan, List<Finding> findings, Path repoDir) {
@@ -66,6 +68,25 @@ public class ProofService {
             } catch (Exception e) {
                 finding.setProofStatus("UNPROVEN");
                 finding.setProof("Unable to verify with Semgrep. " + e.getMessage());
+            }
+
+            // Second proof path (design doc Layer 7): if the Semgrep rule did not confirm the issue,
+            // try to prove it by running an LLM-generated check inside a network-disabled Docker
+            // sandbox. Opt-in and a no-op when Docker is unavailable, so it never downgrades a
+            // Semgrep-confirmed finding.
+            if (!"CONFIRMED".equalsIgnoreCase(finding.getProofStatus())
+                    && sandboxService != null && sandboxService.isEnabled()) {
+                try {
+                    SandboxService.SandboxResult sandbox = sandboxService.proveByTest(finding, repoDir);
+                    if (sandbox.confirmed()) {
+                        finding.setProofStatus("CONFIRMED");
+                        finding.setProof(finding.getProof() + "\n\nSandbox test proof (network-disabled Docker):\n" + sandbox.detail());
+                    } else if ("UNPROVEN".equalsIgnoreCase(finding.getProofStatus())) {
+                        finding.setProof(finding.getProof() + "\n\nSandbox test proof: " + sandbox.status() + " — " + sandbox.detail());
+                    }
+                } catch (Exception ignored) {
+                    // Sandbox failures never affect the Semgrep-derived status.
+                }
             }
         }
     }
