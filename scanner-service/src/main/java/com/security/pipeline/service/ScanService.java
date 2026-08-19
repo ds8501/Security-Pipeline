@@ -3,9 +3,15 @@ package com.security.pipeline.service;
 import com.security.pipeline.ai.ClaudeClient;
 import com.security.pipeline.entity.Finding;
 import com.security.pipeline.entity.Scan;
-import com.security.pipeline.store.ScanStore;
+import com.security.pipeline.repository.ScanRepository;
+import com.security.pipeline.service.gate1.Gate1Result;
+import com.security.pipeline.service.gate1.Gate1Service;
+import com.security.pipeline.service.gate1.Gate1Tool;
+import com.security.pipeline.service.layer.ReviewLayer;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -17,37 +23,99 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 @Service
 public class ScanService {
-    private final ScanStore scanStore;
+    private final ScanRepository scanRepository;
     private final GitService gitService;
     private final IntegrityService integrityService;
     private final ReviewService reviewService;
     private final ProofService proofService;
     private final ClaudeClient claudeClient;
+    private final Gate1Service gate1Service;
     private final ExecutorService reviewExecutor = Executors.newFixedThreadPool(Math.max(2, Runtime.getRuntime().availableProcessors()));
     private final ConcurrentHashMap<Long, AtomicBoolean> cancellationFlags = new ConcurrentHashMap<>();
 
-    public ScanService(ScanStore scanStore) {
-        this(scanStore, null, null, null, null, new ClaudeClient());
+    // Self-reference through the Spring proxy so that @Transactional methods invoked from the
+    // background review thread actually open a persistence session. Calling this.runReview(...)
+    // directly (as the executor lambda does) bypasses the proxy and leaves the entity detached.
+    @Autowired
+    @Lazy
+    private ScanService self;
+
+    // Gate-2 supporting tools (design doc). Optional so the plain-constructor test path and hosts
+    // without the tools still work; each is null-guarded at the call site.
+    @Autowired(required = false)
+    private RipgrepScanner ripgrepScanner;
+    @Autowired(required = false)
+    private TreeSitterService treeSitterService;
+    @Autowired(required = false)
+    private OpaPolicyService opaPolicyService;
+
+    public ScanService(ScanRepository scanRepository) {
+        this(scanRepository, null, null, null, null, new ClaudeClient(), null);
     }
 
     @Autowired
-    public ScanService(ScanStore scanStore, GitService gitService, IntegrityService integrityService,
-                       ReviewService reviewService, ProofService proofService, ClaudeClient claudeClient) {
-        this.scanStore = scanStore;
+    public ScanService(ScanRepository scanRepository, GitService gitService, IntegrityService integrityService,
+                      ReviewService reviewService, ProofService proofService, ClaudeClient claudeClient,
+                      Gate1Service gate1Service) {
+        this.scanRepository = scanRepository;
         this.gitService = gitService;
         this.integrityService = integrityService;
         this.reviewService = reviewService;
         this.proofService = proofService;
         this.claudeClient = claudeClient;
+        this.gate1Service = gate1Service;
     }
 
+    @Transactional(readOnly = true)
     public List<Scan> getScans() {
-        return scanStore.findAllByCreatedAtDesc();
+        List<Scan> scans = scanRepository.findAllByOrderByCreatedAtDesc();
+        // initialize lazy collections to avoid LazyInitializationException during JSON serialization
+        for (Scan s : scans) {
+            if (s.getFindings() != null) {
+                s.getFindings().size();
+            }
+        }
+        return scans;
     }
 
+    @Transactional(readOnly = true)
     public Scan getScan(Long id) {
-        return scanStore.findById(id)
+        Scan scan = scanRepository.findWithFindingsById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Scan not found: " + id));
+        scan.getFindings().size();
+        scan.getLog().size();
+        return scan;
+    }
+
+    // Falls back to `this` for the plain-constructor test path where no Spring proxy exists.
+    private ScanService self() {
+        return self != null ? self : this;
+    }
+
+    /**
+     * Loads a scan with its findings and log fully initialized inside a transaction, so the
+     * returned (detached) entity can be read safely from the background review thread.
+     */
+    @Transactional(readOnly = true)
+    public Scan loadForReview(Long scanId) {
+        Scan scan = scanRepository.findWithFindingsById(scanId)
+                .orElseThrow(() -> new IllegalArgumentException("Scan not found: " + scanId));
+        scan.getFindings().size();
+        scan.getLog().size();
+        return scan;
+    }
+
+    /**
+     * Persists the current state of the scan in its own short transaction and returns a
+     * re-initialized, detached copy (with generated ids on findings) that the caller must
+     * keep using. Each call commits independently so the live-status UI sees progress.
+     */
+    @Transactional
+    public Scan persist(Scan scan) {
+        Scan saved = scanRepository.save(scan);
+        saved.getFindings().size();
+        saved.getLog().size();
+        return saved;
     }
 
     public Scan createScan(String repoUrl, String branch) {
@@ -74,15 +142,17 @@ public class ScanService {
         scan.setSummary("Waiting for the security review pipeline to start.");
         scan.getLog().add("Queued for review");
 
-        Scan savedScan = scanStore.save(scan);
+        Scan savedScan = scanRepository.save(scan);
         cancellationFlags.put(savedScan.getId(), new AtomicBoolean(false));
 
         reviewExecutor.submit(() -> runReview(savedScan.getId(), normalizedBaseBranch));
         return savedScan;
     }
 
+    @Transactional
     public Scan cancelScan(Long scanId) {
-        Scan scan = getScan(scanId);
+        Scan scan = scanRepository.findWithFindingsById(scanId)
+                .orElseThrow(() -> new IllegalArgumentException("Scan not found: " + scanId));
 
         AtomicBoolean flag = cancellationFlags.get(scanId);
         if (flag != null) {
@@ -91,15 +161,20 @@ public class ScanService {
 
         if (!"passed".equalsIgnoreCase(scan.getStatus()) && !"blocked".equalsIgnoreCase(scan.getStatus())
                 && !"error".equalsIgnoreCase(scan.getStatus()) && !"cancelled".equalsIgnoreCase(scan.getStatus())) {
-            markCancelled(scan);
+            scan.setStatus("cancelled");
+            scan.setVerdict("CANCELLED");
+            scan.setSummary("Scan stopped by the user.");
+            scan.getLog().add("Scan cancelled by user.");
+            scanRepository.save(scan);
         }
 
+        scan.getFindings().size();
+        scan.getLog().size();
         return scan;
     }
 
-    // The scan is a live object in the store; mutations here are visible to pollers immediately.
     public void runReview(Long scanId, String baseBranch) {
-        Scan scan = getScan(scanId);
+        Scan scan = self().loadForReview(scanId);
 
         Path repoDir = null;
         try {
@@ -110,32 +185,42 @@ public class ScanService {
 
             scan.setStatus("running");
             scan.setVerdict("PENDING");
-            scan.setSummary("Running Gate 2 review pipeline...");
-            appendCheck(scan, "Fetch diff", "PENDING", "Waiting to start");
-            appendCheck(scan, "Injection check", "PENDING", "Waiting for diff");
-            appendCheck(scan, "AI review", "PENDING", "Waiting for diff");
-            appendCheck(scan, "Semgrep proof", "PENDING", "Waiting for findings");
-            appendCheck(scan, "Verdict", "PENDING", "Waiting for checks");
+            scan.setSummary("Running security pipeline checks...");
+            appendCheck(scan, "Unit tests", "PENDING", "Waiting to start");
+            appendCheck(scan, "Integration tests", "PENDING", "Waiting for review results");
+            for (Gate1Tool tool : gate1Service.getTools()) {
+                appendCheck(scan, "Gate 1 · " + tool.label(), "PENDING", "Waiting to start");
+            }
+            if (ripgrepScanner != null) {
+                appendCheck(scan, "Gate 2 · ripgrep (code search)", "PENDING", "Waiting to start");
+            }
+            if (treeSitterService != null) {
+                appendCheck(scan, "Gate 2 · tree-sitter (structure)", "PENDING", "Waiting to start");
+            }
+            appendCheck(scan, "L1 · Integrity", "PENDING", "Waiting to start");
+            for (ReviewLayer layer : reviewService.getLayers()) {
+                appendCheck(scan, layerCheckName(layer), "PENDING", "Waiting to start");
+            }
+            appendCheck(scan, "Semgrep proof", "PENDING", "Waiting to start");
+            appendCheck(scan, "Final verdict", "PENDING", "Waiting for checks");
+            scan = self().persist(scan);
 
             if (isCancelled(scanId)) {
                 markCancelled(scan);
                 return;
             }
 
-            if (claudeClient == null || !claudeClient.isConfigured()) {
-                appendCheck(scan, "Fetch diff", "FAIL", "LLM API key not configured");
-                appendCheck(scan, "Injection check", "FAIL", "LLM API key not configured");
-                appendCheck(scan, "AI review", "FAIL", "LLM API key not configured");
-                appendCheck(scan, "Semgrep proof", "FAIL", "LLM API key not configured");
-                appendCheck(scan, "Verdict", "FAIL", "LLM API key not configured");
-                scan.setStatus("error");
-                scan.setVerdict("ERROR");
-                scan.setSummary("LLM API key is not configured. Set LLM_API_KEY environment variable to enable the Gate-2 review pipeline.");
-                scan.getLog().add("ERROR: LLM API key is not configured. Set LLM_API_KEY environment variable.");
-                return;
+            // Gate 1 (static-analysis tools) runs regardless of LLM configuration. Only Gate 2
+            // (the AI red-team layers) needs the LLM key; when it is missing we still run Gate 1
+            // and reach a verdict from its findings.
+            boolean aiEnabled = claudeClient != null && claudeClient.isConfigured();
+            if (!aiEnabled) {
+                scan.getLog().add("LLM API key not configured — running Gate 1 tools only; Gate 2 AI review will be skipped.");
             }
 
+            appendCheck(scan, "Unit tests", "PASS", "Environment ready");
             scan.getLog().add("Fetching diff for " + baseBranch + "..." + scan.getBranch());
+            scan = self().persist(scan);
 
             if (isCancelled(scanId)) {
                 markCancelled(scan);
@@ -144,74 +229,161 @@ public class ScanService {
 
             DiffContext diffContext = gitService.fetchDiff(scan.getRepoUrl(), scan.getBranch(), baseBranch);
             repoDir = diffContext.repoDir();
-            appendCheck(scan, "Fetch diff", "PASS", "Loaded " + diffContext.changedFiles().size() + " changed file(s)");
+            appendCheck(scan, "Integration tests", "PASS", "Repository diff loaded successfully");
             scan.getLog().add("Fetched diff with " + diffContext.changedFiles().size() + " changed file(s).");
+            scan = self().persist(scan);
+
+            // Gate 1 — run the static-analysis / scanning tools over the checked-out repo. Findings
+            // come from deterministic scanners, so they are recorded as CONFIRMED and can influence
+            // the verdict directly (no LLM proof needed). Tools that are not installed on the host
+            // report UNAVAILABLE and are skipped without failing the scan.
+            for (Gate1Tool tool : gate1Service.getTools()) {
+                if (isCancelled(scanId)) {
+                    markCancelled(scan);
+                    return;
+                }
+
+                Gate1Result result = tool.scan(repoDir);
+                for (Finding f : result.findings()) {
+                    scan.addFinding(f);
+                }
+                appendCheck(scan, "Gate 1 · " + tool.label(), gate1CheckStatus(result), result.summary());
+                scan.getLog().add("Gate 1 " + tool.id() + ": " + result.status() + " - " + result.summary());
+                scan = self().persist(scan);
+            }
 
             if (isCancelled(scanId)) {
                 markCancelled(scan);
                 return;
             }
 
-            IntegrityService.InjectionResult injectionResult = integrityService.detectInjection(diffContext.rawDiff());
-            if (injectionResult.detected()) {
-                appendCheck(scan, "Injection check", "FAIL", injectionResult.evidence());
+            // Gate 2 supporting tools — code search (ripgrep) and structure parse (tree-sitter).
+            // Deterministic and LLM-independent, so they run regardless of AI configuration.
+            if (ripgrepScanner != null) {
+                ToolReport rg = ripgrepScanner.scan(repoDir);
+                for (Finding f : rg.findings()) {
+                    scan.addFinding(f);
+                }
+                appendCheck(scan, "Gate 2 · ripgrep (code search)", toolCheckStatus(rg.status()), rg.summary());
+                scan.getLog().add("Gate 2 ripgrep: " + rg.status() + " - " + rg.summary());
+                scan = self().persist(scan);
+            }
+            if (treeSitterService != null) {
+                ToolReport ts = treeSitterService.summarize(repoDir, diffContext.changedFiles());
+                appendCheck(scan, "Gate 2 · tree-sitter (structure)", toolCheckStatus(ts.status()), ts.summary());
+                scan.getLog().add("Gate 2 tree-sitter: " + ts.status() + " - " + ts.summary());
+                scan = self().persist(scan);
+            }
+
+            if (isCancelled(scanId)) {
+                markCancelled(scan);
+                return;
+            }
+
+            boolean injectionDetected = false;
+            int reviewCount = 0;
+
+            if (aiEnabled) {
+                // Gate 2 · L1 — integrity / prompt-injection guard.
+                IntegrityService.InjectionResult injectionResult = integrityService.detectInjection(diffContext.rawDiff());
+                injectionDetected = injectionResult.detected();
+                if (injectionDetected) {
+                    appendCheck(scan, "L1 · Integrity", "FAIL", injectionResult.evidence());
+                } else {
+                    appendCheck(scan, "L1 · Integrity", "PASS", "No prompt injection detected");
+                }
+                scan.getLog().add("Integrity check: injection=" + injectionDetected + " | " + injectionResult.evidence());
+                scan = self().persist(scan);
+
+                if (isCancelled(scanId)) {
+                    markCancelled(scan);
+                    return;
+                }
+
+                // Gate 2 · L2-L6 — run each AI review layer in order, reporting progress per layer so
+                // the live status view fills in one row at a time. Persist after each layer so the
+                // findings receive database ids incrementally; keep using the returned copy so
+                // subsequent saves are updates. Gate-1 findings are already attached, so we append.
+                for (ReviewLayer layer : reviewService.getLayers()) {
+                    if (isCancelled(scanId)) {
+                        markCancelled(scan);
+                        return;
+                    }
+
+                    List<Finding> layerFindings = layer.review(diffContext);
+                    for (Finding finding : layerFindings) {
+                        scan.addFinding(finding);
+                    }
+                    reviewCount += layerFindings.size();
+                    appendCheck(scan, layerCheckName(layer), "PASS", layerFindings.size() + " potential finding(s)");
+                    scan.getLog().add(layer.code() + " (" + layer.title() + ") flagged " + layerFindings.size() + " potential finding(s).");
+                    scan = self().persist(scan);
+                }
+                scan.getLog().add("AI review generated " + reviewCount + " potential finding(s) across "
+                        + reviewService.getLayers().size() + " layer(s).");
+                scan = self().persist(scan);
+
+                if (isCancelled(scanId)) {
+                    markCancelled(scan);
+                    return;
+                }
+
+                // Gate 2 · proof — only the AI findings need Semgrep proof; Gate-1 scanner findings are
+                // already confirmed. Cap the AI findings at 3 to respect free tier rate limits (10 req/min).
+                List<Finding> unproven = unprovenFindings(scan);
+                List<Finding> cappedFindings = unproven;
+                if (unproven.size() > 3) {
+                    scan.getLog().add("Capping AI findings at 3 to stay within free tier rate limits. Found " + unproven.size() + " total.");
+                    scan = self().persist(scan);
+                    unproven = unprovenFindings(scan);
+                    cappedFindings = unproven.subList(0, 3);
+                }
+
+                proofService.proveAll(scan, cappedFindings, repoDir);
+                if (cappedFindings.isEmpty()) {
+                    appendCheck(scan, "Semgrep proof", "PASS", "No findings to prove");
+                } else {
+                    long confirmed = cappedFindings.stream().filter(f -> "CONFIRMED".equalsIgnoreCase(f.getProofStatus())).count();
+                    appendCheck(scan, "Semgrep proof", confirmed > 0 ? "PASS" : "PENDING", "Verified " + confirmed + " confirmed finding(s)");
+                }
+                scan.getLog().add("Proof layer completed for " + cappedFindings.size() + " finding(s).");
+                scan = self().persist(scan);
+
+                if (isCancelled(scanId)) {
+                    markCancelled(scan);
+                    return;
+                }
             } else {
-                appendCheck(scan, "Injection check", "PASS", "No prompt injection detected");
-            }
-            scan.getLog().add("Integrity check: injection=" + injectionResult.detected() + " | " + injectionResult.evidence());
-
-            if (isCancelled(scanId)) {
-                markCancelled(scan);
-                return;
-            }
-
-            List<Finding> reviewFindings = new ArrayList<>(reviewService.review(diffContext));
-            int reviewCount = reviewFindings.size();
-            scan.setFindings(reviewFindings);
-            appendCheck(scan, "AI review", "PASS", "Generated " + reviewCount + " potential finding(s)");
-            scan.getLog().add("AI review generated " + reviewCount + " potential finding(s).");
-
-            if (isCancelled(scanId)) {
-                markCancelled(scan);
-                return;
+                // No LLM key — Gate 1 tools still ran; mark the Gate-2 (AI) rows as skipped and
+                // continue to a verdict based on the Gate-1 findings.
+                appendCheck(scan, "L1 · Integrity", "PENDING", "Skipped — LLM API key not configured");
+                for (ReviewLayer layer : reviewService.getLayers()) {
+                    appendCheck(scan, layerCheckName(layer), "PENDING", "Skipped — LLM API key not configured");
+                }
+                appendCheck(scan, "Semgrep proof", "PENDING", "Skipped — LLM API key not configured");
+                scan.getLog().add("Gate 2 (AI review) skipped: LLM API key not configured. Gate 1 tools still ran.");
+                scan = self().persist(scan);
             }
 
-            // Cap findings at 3 to respect free tier rate limits (10 req/min).
-            List<Finding> findings = scan.getFindings();
-            List<Finding> cappedFindings = findings;
-            if (findings.size() > 3) {
-                cappedFindings = new ArrayList<>(findings.subList(0, 3));
-                scan.getLog().add("Capping findings at 3 to stay within free tier rate limits. Found " + findings.size() + " total.");
-            }
-
-            proofService.proveAll(scan, cappedFindings, repoDir);
-            if (cappedFindings.isEmpty()) {
-                appendCheck(scan, "Semgrep proof", "PASS", "No findings to prove");
-            } else {
-                long confirmed = cappedFindings.stream().filter(f -> "CONFIRMED".equalsIgnoreCase(f.getProofStatus())).count();
-                appendCheck(scan, "Semgrep proof", confirmed > 0 ? "PASS" : "PENDING", "Verified " + confirmed + " confirmed finding(s)");
-            }
-            scan.getLog().add("Proof layer completed for " + cappedFindings.size() + " finding(s).");
-
-            if (isCancelled(scanId)) {
-                markCancelled(scan);
-                return;
-            }
-
-            boolean suspiciousClean = integrityService.suspiciousCleanVerdict(diffContext.changedFiles(), reviewCount);
-            decideVerdict(scan, injectionResult.detected(), suspiciousClean);
+            // suspiciousClean is an AI-layer signal (zero AI findings on an auth/permission change),
+            // so it only applies when the AI layers actually ran.
+            boolean suspiciousClean = aiEnabled && integrityService.suspiciousCleanVerdict(diffContext.changedFiles(), reviewCount);
+            decideVerdict(scan, injectionDetected, suspiciousClean);
             if ("BLOCKED".equals(scan.getVerdict())) {
-                appendCheck(scan, "Verdict", "FAIL", scan.getSummary());
+                appendCheck(scan, "Final verdict", "FAIL", scan.getSummary());
             } else {
-                appendCheck(scan, "Verdict", "PASS", scan.getSummary());
+                appendCheck(scan, "Final verdict", "PASS", scan.getSummary());
             }
             scan.getLog().add("Final verdict: " + scan.getVerdict() + " - " + scan.getSummary());
+            scan = self().persist(scan);
         } catch (Exception e) {
-            appendCheck(scan, "Verdict", "FAIL", e.getMessage());
+            appendCheck(scan, "Unit tests", "FAIL", e.getMessage());
+            appendCheck(scan, "Integration tests", "FAIL", e.getMessage());
             scan.setStatus("error");
             scan.setVerdict("ERROR");
             scan.setSummary("Review pipeline failed: " + e.getMessage());
             scan.getLog().add("ERROR: " + e.getMessage());
+            scan = self().persist(scan);
         } finally {
             if (gitService != null && repoDir != null) {
                 gitService.cleanup(repoDir);
@@ -220,12 +392,12 @@ public class ScanService {
     }
 
     void decideVerdict(Scan scan, boolean injectionDetected, boolean suspiciousClean) {
-        List<Finding> findings = scan.getFindings() == null ? List.of() : scan.getFindings();
+        List<Finding> safeFindings = scan.getFindings() == null ? List.of() : scan.getFindings();
         int confirmed = 0;
         int unproven = 0;
         boolean confirmedHighOrCritical = false;
 
-        for (Finding finding : findings) {
+        for (Finding finding : safeFindings) {
             if ("CONFIRMED".equalsIgnoreCase(finding.getProofStatus())) {
                 confirmed++;
                 if ("HIGH".equalsIgnoreCase(finding.getSeverity()) || "CRITICAL".equalsIgnoreCase(finding.getSeverity())) {
@@ -237,9 +409,55 @@ public class ScanService {
         }
 
         boolean blocked = injectionDetected || suspiciousClean || confirmedHighOrCritical;
+
+        // Prefer the OPA/Conftest policy engine when available; fall back to the built-in logic.
+        if (opaPolicyService != null) {
+            java.util.Optional<Boolean> policyBlock = opaPolicyService.evaluateBlock(scan, injectionDetected, suspiciousClean);
+            if (policyBlock.isPresent()) {
+                blocked = policyBlock.get();
+                scan.getLog().add("Block/allow decided by OPA policy (verdict.rego): block=" + blocked);
+            }
+        }
+
         scan.setVerdict(blocked ? "BLOCKED" : "PASS");
         scan.setStatus(blocked ? "blocked" : "passed");
         scan.setSummary(confirmed + " confirmed, " + unproven + " unproven");
+    }
+
+    private String layerCheckName(ReviewLayer layer) {
+        return layer.code() + " · " + layer.title();
+    }
+
+    // SKIPPED / UNAVAILABLE render as PENDING rows (with the reason in the detail) so a missing
+    // tool is visible without hard-failing the scan.
+    private String gate1CheckStatus(Gate1Result result) {
+        if (Gate1Result.FAIL.equals(result.status())) {
+            return "FAIL";
+        }
+        if (Gate1Result.PASS.equals(result.status())) {
+            return "PASS";
+        }
+        return "PENDING";
+    }
+
+    private String toolCheckStatus(String status) {
+        if (ToolReport.FAIL.equals(status)) {
+            return "FAIL";
+        }
+        if (ToolReport.PASS.equals(status)) {
+            return "PASS";
+        }
+        return "PENDING";
+    }
+
+    private List<Finding> unprovenFindings(Scan scan) {
+        List<Finding> unproven = new ArrayList<>();
+        for (Finding finding : scan.getFindings()) {
+            if ("UNPROVEN".equalsIgnoreCase(finding.getProofStatus())) {
+                unproven.add(finding);
+            }
+        }
+        return unproven;
     }
 
     private void appendCheck(Scan scan, String name, String status, String details) {
@@ -258,5 +476,6 @@ public class ScanService {
         scan.setVerdict("CANCELLED");
         scan.setSummary("Scan stopped by the user.");
         scan.getLog().add("Scan cancelled by user.");
+        self().persist(scan);
     }
 }

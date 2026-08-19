@@ -1,17 +1,65 @@
 package com.security.pipeline.entity;
 
-/** In-memory finding record produced by the AI review and annotated by the proof layer. */
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.Table;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
+@Entity
+@Table(name = "findings")
 public class Finding {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
     private String title;
+
+    @Column(nullable = false)
     private String severity;
+
+    @Column(nullable = false)
     private String file;
+
     private Integer line;
+
+    @Column(length = 4000)
     private String description;
+
+    @Column(length = 4000)
     private String proof;
+
+    @Column(length = 4000)
     private String fix;
+
     private String cwe;
+
     private String owasp;
+
+    // Which Gate-2 review layer produced this finding (e.g. "L2"). Null for legacy/manual findings.
+    private String layer;
+
+    @Column(nullable = false)
     private String proofStatus = "UNPROVEN";
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "scan_id", nullable = false)
+    @JsonIgnore
+    private Scan scan;
+
+    public Long getId() {
+        return id;
+    }
+
+    public void setId(Long id) {
+        this.id = id;
+    }
 
     public String getTitle() {
         return title;
@@ -91,5 +139,21 @@ public class Finding {
 
     public void setProofStatus(String proofStatus) {
         this.proofStatus = proofStatus;
+    }
+
+    public String getLayer() {
+        return layer;
+    }
+
+    public void setLayer(String layer) {
+        this.layer = layer;
+    }
+
+    public Scan getScan() {
+        return scan;
+    }
+
+    public void setScan(Scan scan) {
+        this.scan = scan;
     }
 }
