@@ -99,6 +99,10 @@ A single scan through `POST /api/scans` now runs **both gates** in sequence agai
 2. **Gate 2 supporting tools** — **ripgrep** (`RipgrepScanner`) sweeps for security hotspots, and
    **tree-sitter** (`TreeSitterService`) parses the changed files for a structural summary. Both are
    deterministic, LLM-independent, and degrade to `UNAVAILABLE` when their binary is missing.
+   - **Red Team (DAST)** — `RedTeamService` performs live, non-destructive probing (security headers,
+     TLS, exposed sensitive paths, admin surface, optional `nuclei`) against the **public** targets
+     declared in `.secgate/services.yaml` (parsed by `ServiceInventory`). Live-observed findings are
+     recorded `CONFIRMED` and can drive the verdict; private targets are out of scope.
 3. **Gate 2 layers** — L1 integrity, then the L2–L6 AI review, then proof of the AI findings. Proof
    has two paths: an LLM-generated **Semgrep rule** that must fire on the code, and — when enabled
    (`SANDBOX_ENABLED=true`, Docker present) — a **sandboxed test proof** that runs an LLM-generated

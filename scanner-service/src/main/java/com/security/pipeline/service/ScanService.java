@@ -2,7 +2,9 @@ package com.security.pipeline.service;
 
 import com.security.pipeline.ai.ClaudeClient;
 import com.security.pipeline.entity.Finding;
+import com.security.pipeline.entity.RedTeamFinding;
 import com.security.pipeline.entity.Scan;
+import com.security.pipeline.entity.ServiceEntry;
 import com.security.pipeline.repository.ScanRepository;
 import com.security.pipeline.service.gate1.Gate1Result;
 import com.security.pipeline.service.gate1.Gate1Service;
@@ -48,6 +50,10 @@ public class ScanService {
     private TreeSitterService treeSitterService;
     @Autowired(required = false)
     private OpaPolicyService opaPolicyService;
+    @Autowired(required = false)
+    private RedTeamService redTeamService;
+    @Autowired(required = false)
+    private ServiceInventory serviceInventory;
 
     public ScanService(ScanRepository scanRepository) {
         this(scanRepository, null, null, null, null, new ClaudeClient(), null);
@@ -197,6 +203,9 @@ public class ScanService {
             if (treeSitterService != null) {
                 appendCheck(scan, "Gate 2 · tree-sitter (structure)", "PENDING", "Waiting to start");
             }
+            if (redTeamService != null && serviceInventory != null) {
+                appendCheck(scan, "Gate 2 · Red Team (DAST)", "PENDING", "Waiting to start");
+            }
             appendCheck(scan, "L1 · Integrity", "PENDING", "Waiting to start");
             for (ReviewLayer layer : reviewService.getLayers()) {
                 appendCheck(scan, layerCheckName(layer), "PENDING", "Waiting to start");
@@ -273,6 +282,13 @@ public class ScanService {
                 appendCheck(scan, "Gate 2 · tree-sitter (structure)", toolCheckStatus(ts.status()), ts.summary());
                 scan.getLog().add("Gate 2 tree-sitter: " + ts.status() + " - " + ts.summary());
                 scan = self().persist(scan);
+            }
+
+            // Gate 2 · Red Team (DAST) — live, non-destructive probing of the PUBLIC targets declared
+            // in .secgate/services.yaml (security headers, TLS, exposed sensitive paths, admin
+            // surface, optional nuclei). Findings are live-observed, so they are recorded CONFIRMED.
+            if (redTeamService != null && serviceInventory != null) {
+                scan = runRedTeam(scan, repoDir);
             }
 
             if (isCancelled(scanId)) {
@@ -438,6 +454,65 @@ public class ScanService {
             return "PASS";
         }
         return "PENDING";
+    }
+
+    // Runs the red-team DAST probe over the public targets in .secgate/services.yaml, folds the
+    // findings into the scan, and returns the re-initialized scan copy.
+    private Scan runRedTeam(Scan scan, Path repoDir) {
+        List<ServiceEntry> inventory = serviceInventory.fromDir(repoDir);
+        List<String> targets = new ArrayList<>();
+        for (ServiceEntry entry : inventory) {
+            if (entry != null && entry.isPublic() && entry.getUrl() != null && !entry.getUrl().isBlank()) {
+                targets.add(entry.getUrl().trim());
+            }
+        }
+
+        if (targets.isEmpty()) {
+            appendCheck(scan, "Gate 2 · Red Team (DAST)", "PENDING", "No public targets in .secgate/services.yaml");
+            scan.getLog().add("Gate 2 red team: skipped — no public targets declared.");
+            return self().persist(scan);
+        }
+
+        List<String> probeLog = new ArrayList<>();
+        List<RedTeamFinding> redTeamFindings;
+        try {
+            redTeamFindings = redTeamService.probe(targets, probeLog::add);
+        } catch (Exception e) {
+            appendCheck(scan, "Gate 2 · Red Team (DAST)", "PENDING", "Probe error: " + e.getMessage());
+            scan.getLog().add("Gate 2 red team: error — " + e.getMessage());
+            return self().persist(scan);
+        }
+
+        for (RedTeamFinding rtf : redTeamFindings) {
+            scan.addFinding(toFinding(rtf));
+        }
+        for (String line : probeLog) {
+            scan.getLog().add("Red Team: " + line);
+        }
+        String summary = redTeamFindings.isEmpty()
+                ? "No issues on " + targets.size() + " public target(s)"
+                : redTeamFindings.size() + " finding(s) on " + targets.size() + " public target(s)";
+        appendCheck(scan, "Gate 2 · Red Team (DAST)", redTeamFindings.isEmpty() ? "PASS" : "FAIL", summary);
+        scan.getLog().add("Gate 2 red team: " + summary);
+        return self().persist(scan);
+    }
+
+    private Finding toFinding(RedTeamFinding rtf) {
+        Finding f = new Finding();
+        f.setTitle(rtf.getTitle() == null ? "Red-team finding" : rtf.getTitle());
+        String sev = rtf.getSeverity() == null ? "LOW" : rtf.getSeverity().toUpperCase();
+        f.setSeverity("INFO".equals(sev) ? "LOW" : sev);
+        f.setFile(rtf.getTarget() == null ? "unknown" : rtf.getTarget());
+        f.setLine(1);
+        f.setDescription((rtf.getCategory() == null ? "" : rtf.getCategory() + ": ")
+                + (rtf.getEvidence() == null ? "" : rtf.getEvidence()));
+        f.setFix(rtf.getRecommendation() == null ? "Review and remediate the exposed surface." : rtf.getRecommendation());
+        f.setCwe("CWE-693");
+        f.setOwasp("A05:2021");
+        f.setLayer("Gate 2 · Red Team (DAST)");
+        f.setProofStatus("CONFIRMED");
+        f.setProof(rtf.getEvidence() == null ? "Live DAST observation." : rtf.getEvidence());
+        return f;
     }
 
     private String toolCheckStatus(String status) {
