@@ -17,100 +17,237 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          java-version: '21'
+          java-version: '17'
           distribution: 'temurin'
           cache: maven
+
+      # The proof layer verifies each finding with Semgrep before it can affect the verdict.
+      - name: Install Semgrep
+        run: python3 -m pip install --quiet semgrep
 
       - name: Build scanner-service
         working-directory: ./scanner-service
         run: mvn clean package -DskipTests -q
 
-      - name: Get PR diff
+      # Base security reviewer (design doc). Anthropic's official action reviews the PR diff and
+      # posts its own findings. Gated on ANTHROPIC_API_KEY so it is skipped (not failed) when absent.
+      - name: Check Anthropic reviewer configuration
+        id: sec_cfg
         env:
-          BASE_REF: ${{ github.base_ref }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}" || true
-          git diff "origin/${BASE_REF}..HEAD" > /tmp/pr.diff
-          echo "=== PR Diff ==="
-          head -50 /tmp/pr.diff
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "ANTHROPIC_API_KEY not set - claude-code-security-review will be skipped."
+          fi
 
-      - name: Run security pipeline review
+      - name: Claude Code security review
+        if: steps.sec_cfg.outputs.enabled == 'true'
+        uses: anthropics/claude-code-security-review@main
+        with:
+          claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          comment-pr: true
+
+      # LLM_API_KEY drives the L1-L6 review. It is unavailable on fork PRs and optional in general;
+      # when absent we post a neutral note and skip the AI review rather than failing every PR.
+      - name: Check review configuration
+        id: cfg
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -n "$LLM_API_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "LLM_API_KEY not set - Gate 2 AI review will be skipped."
+          fi
+
+      # Started regardless of LLM config: the AI review may skip, but the service still needs to be
+      # up for the ZAP DAST scan below.
+      - name: Start scanner-service
         working-directory: ./scanner-service
         env:
-          HEAD_REF: ${{ github.head_ref }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          # Docker is available on the runner, so exercise the sandboxed test-proof path.
+          SANDBOX_ENABLED: 'true'
         run: |
-          echo "Scanning PR: ${HEAD_REF}"
+          JAR="$(ls target/*.jar | grep -v '\.original$' | head -n1)"
+          echo "Launching $JAR"
+          nohup java -jar "$JAR" > /tmp/app.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/api/health > /dev/null; then
+              echo "Service is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Service failed to start:"
+          cat /tmp/app.log
+          exit 1
 
-          # Check for sensitive keywords in diff
-          if grep -qi "password\|secret\|token\|key\|credential" /tmp/pr.diff; then
-            echo "⚠️  Potential credential leak detected"
+      - name: Run layered security review (L1-L6)
+        if: steps.cfg.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Clone URL includes the token so the service can fetch the PR head (same-repo PRs).
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${{ github.event.pull_request.head.repo.full_name }}.git"
+          HEAD_REF="${{ github.event.pull_request.head.ref }}"
+          BASE_REF="${{ github.base_ref }}"
+          echo "Reviewing $HEAD_REF against $BASE_REF"
+
+          BODY="$(jq -n --arg r "$REPO_URL" --arg b "$HEAD_REF" --arg base "$BASE_REF" \
+            '{repoUrl:$r, branch:$b, baseBranch:$base}')"
+          CREATE="$(curl -sf -X POST http://localhost:8080/api/scans \
+            -H 'content-type: application/json' -d "$BODY")"
+          SCAN_ID="$(echo "$CREATE" | jq -r '.id')"
+          echo "Scan id: $SCAN_ID"
+
+          RESP="$CREATE"
+          STATUS="queued"
+          for i in $(seq 1 90); do
+            RESP="$(curl -sf http://localhost:8080/api/scans/$SCAN_ID)"
+            STATUS="$(echo "$RESP" | jq -r '.status')"
+            echo "  [$i] status=$STATUS"
+            case "$STATUS" in
+              passed|blocked|error|cancelled) break ;;
+            esac
+            sleep 5
+          done
+
+          echo "$RESP" > /tmp/scan.json
+          if [ "$STATUS" != "passed" ] && [ "$STATUS" != "blocked" ] && [ "$STATUS" != "error" ] && [ "$STATUS" != "cancelled" ]; then
+            echo "Review did not reach a terminal state (last status: $STATUS)."
+            echo '{"verdict":"ERROR","status":"timeout","summary":"Gate 2 review timed out before completing.","findings":[]}' > /tmp/scan.json
           fi
 
-          # Check for unsafe patterns
-          if grep -qi "logger.info.*user\|console.log.*secret" /tmp/pr.diff; then
-            echo "⚠️  Sensitive data logging detected"
+      # Block/allow decision via the OPA policy engine (design doc), evaluated against the same
+      # verdict.rego the service uses. Independently enforces the policy on the review's findings.
+      - name: Policy gate (OPA)
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          curl -sSL -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          chmod +x opa
+          # Build the policy input from the scan result (injection signal read from the log).
+          INJECTION=$(jq -r '[.log[]? | select(test("injection=true"))] | (length > 0)' /tmp/scan.json)
+          jq --argjson inj "${INJECTION:-false}" \
+            '{injectionDetected: $inj, suspiciousClean: false, findings: [.findings[]? | {severity, proofStatus}]}' \
+            /tmp/scan.json > /tmp/policy-input.json
+          ./opa eval --format json \
+            --data scanner-service/src/main/resources/policy/verdict.rego \
+            --input /tmp/policy-input.json 'data.secgate.block' > /tmp/opa-out.json
+          BLOCK=$(jq -r '.result[0].expressions[0].value' /tmp/opa-out.json)
+          echo "OPA policy decision: block=$BLOCK"
+          if [ "$BLOCK" = "true" ]; then
+            echo "❌ OPA policy blocked the merge"
+            exit 1
           fi
 
-          echo "Review complete"
+      # Dynamic testing — spider + passively scan the running service. Baseline is non-blocking
+      # (informational); the HTML/JSON reports are uploaded as artifacts. --network host lets the
+      # ZAP container reach the service on the runner's localhost.
+      - name: OWASP ZAP baseline scan (DAST)
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:8080 \
+            -r zap-report.html -J zap-report.json -a || true
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline-report
+          path: |
+            zap-report.html
+            zap-report.json
+          if-no-files-found: ignore
 
       - name: Comment PR with findings
         if: always()
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            
-            let findings = [];
-            
-            // Check diff for issues
-            const diffContent = require('fs').readFileSync('/tmp/pr.diff', 'utf8');
-            
-            if (diffContent.includes('vulnerable') || diffContent.includes('secret') || diffContent.includes('unsafe')) {
-              findings.push({
-                severity: 'BLOCKED',
-                title: 'Potential security issue detected',
-                message: 'The diff contains patterns that may indicate security risks. Please review before merge.'
-              });
-            }
-            
-            if (findings.length > 0) {
-              let comment = '## 🔐 Security Pipeline Review\n\n';
-              comment += '### ⛔ BLOCKED - Critical Issues Found\n\n';
-              findings.forEach(f => {
-                comment += `- **${f.title}**: ${f.message}\n`;
-              });
-              comment += '\nPlease address these issues before the PR can be merged.';
-              
-              github.rest.issues.createComment({
+            const configured = '${{ steps.cfg.outputs.configured }}' === 'true';
+
+            if (!configured) {
+              await github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: comment
+                body: '## 🔐 Security Pipeline Gate 2\n\n### ⏭️ Skipped — AI review not configured\n\n' +
+                      '`LLM_API_KEY` is not available for this run (it is not set, or this is a fork PR). ' +
+                      'The layered L1–L6 review did not run. Configure the secret to enable Gate 2.'
               });
-              
-              core.setFailed('Security issues found - PR review blocked');
-            } else {
-              let comment = '## 🔐 Security Pipeline Review\n\n';
-              comment += '### ✅ PASS - No critical issues detected\n\n';
-              comment += 'This PR passed automated security review. Ready for merge.';
-              
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: comment
-              });
+              return;
             }
 
-      - name: Set PR check status
+            let scan;
+            try {
+              scan = JSON.parse(fs.readFileSync('/tmp/scan.json', 'utf8'));
+            } catch (e) {
+              scan = { verdict: 'ERROR', summary: 'Gate 2 could not read review results.', findings: [] };
+            }
+
+            const verdict = scan.verdict || 'ERROR';
+            const findings = Array.isArray(scan.findings) ? scan.findings : [];
+
+            let comment = '## 🔐 Security Pipeline Gate 2 — AI Review (L1–L6)\n\n';
+            if (verdict === 'BLOCKED') {
+              comment += '### ⛔ BLOCKED\n\n';
+            } else if (verdict === 'PASS') {
+              comment += '### ✅ PASS\n\n';
+            } else {
+              comment += `### ⚠️ ${verdict}\n\n`;
+            }
+            comment += `**Summary:** ${scan.summary || 'n/a'}\n\n`;
+
+            if (findings.length) {
+              // Group findings by the layer that produced them.
+              const byLayer = {};
+              for (const f of findings) {
+                const key = f.layer || 'L?';
+                (byLayer[key] = byLayer[key] || []).push(f);
+              }
+              comment += `**${findings.length} finding(s):**\n\n`;
+              for (const layer of Object.keys(byLayer).sort()) {
+                comment += `#### ${layer}\n`;
+                for (const f of byLayer[layer]) {
+                  const proven = (f.proofStatus || '').toUpperCase() === 'CONFIRMED' ? '✅ confirmed' : '• unproven';
+                  comment += `- **${f.severity} — ${f.title}** (${f.file}:${f.line}, ${f.cwe || 'CWE-?'}) — ${proven}\n`;
+                }
+                comment += '\n';
+              }
+            } else {
+              comment += 'No findings were reported.\n';
+            }
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+            if (verdict === 'BLOCKED' || verdict === 'ERROR') {
+              core.setFailed(`Gate 2 verdict: ${verdict}`);
+            }
+
+      - name: Stop scanner-service
         if: always()
-        run: |
-          echo "Security pipeline review complete"
+        run: pkill -f 'target/.*\.jar' || true
