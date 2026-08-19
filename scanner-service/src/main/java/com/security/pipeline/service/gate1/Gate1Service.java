@@ -10,7 +10,9 @@ import java.util.List;
  * before the Gate-2 AI layers so that a single run covers both gates (tests/scanning first, then
  * the AI red-team review).
  */
-@Service
+// Distinct bean name so it coexists with the legacy com.security.pipeline.service.Gate1Service
+// (which backs the /api/gate1 UI endpoints); this one is injected by type, not name.
+@Service("gate1ToolService")
 public class Gate1Service {
     private final List<Gate1Tool> tools;
 
