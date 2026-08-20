@@ -283,7 +283,157 @@ $('stop-scan-btn').addEventListener('click', async () => {
   await fetch(`${API_BASE}/scans/${selectedScanId}/cancel`, { method: 'POST' });
   await loadScans();
 });
-$('view-report').addEventListener('click', () => $('failures').scrollIntoView({ behavior: 'smooth' }));
+/* ---------- downloadable PDF report ---------- */
+function esc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// What tool backs each step and what it checks — shown in the report so the reader knows exactly
+// which tool ran which test. Matched by substring against the check-row name.
+const STEP_META = [
+  ['Unit tests', 'Runtime / JUnit', 'Verifies the review environment and toolchain are ready'],
+  ['Integration tests', 'Git', 'Clones the repository and loads the PR diff (base → branch)'],
+  ['ripgrep', 'ripgrep', 'Fast regex sweep for security hotspots: hardcoded secrets, command exec, unsafe deserialization, disabled TLS, weak crypto'],
+  ['tree-sitter', 'tree-sitter CLI', 'Parses the changed source files into ASTs for a structural summary'],
+  ['Red Team', 'RedTeamService (HTTP + nuclei)', 'Live DAST probe of PUBLIC targets in .secgate/services.yaml: security headers, TLS, exposed sensitive paths, admin surface'],
+  ['L1', 'LLM — integrity guard', 'Detects prompt-injection / instruction tampering in the diff (untrusted-content check)'],
+  ['L2', 'LLM — AI review', 'Broken access control, IDOR, missing authz (OWASP A01)'],
+  ['L3', 'LLM — AI review', 'Secrets, PII, sensitive logging, crypto failures (OWASP A02)'],
+  ['L4', 'LLM — AI review', 'SQL/command injection, XSS, path traversal, deserialization (OWASP A03)'],
+  ['L5', 'LLM — AI review', 'Vulnerable/outdated components & supply-chain risk (OWASP A06)'],
+  ['L6', 'LLM — AI review', 'Insecure design & business-logic flaws, fail-open handling (OWASP A04)'],
+  ['Semgrep proof', 'Semgrep + Docker sandbox', 'Verifies each AI finding with a generated Semgrep rule, then an optional network-disabled sandbox test — only proven findings block'],
+  ['Final verdict', 'OPA policy / decision engine', 'Applies the block-vs-allow policy over the confirmed findings'],
+  // Gate-1 tools (when a Gate-1 run is reported)
+  ['Semgrep (SAST)', 'Semgrep', 'Static analysis with the p/security-audit ruleset'],
+  ['Gitleaks', 'Gitleaks', 'Scans the repo for committed secrets/credentials'],
+  ['osv-scanner', 'osv-scanner', 'Checks dependencies against the OSV vulnerability database'],
+  ['Trivy', 'Trivy', 'Filesystem vuln + IaC/container misconfig + secret scan'],
+  ['Syft', 'Syft', 'Generates the CycloneDX software bill of materials (SBOM)'],
+  ['actionlint', 'actionlint', 'Lints GitHub Actions workflow files'],
+  ['zizmor', 'zizmor', 'Audits CI/CD workflows for security weaknesses'],
+];
+function stepMeta(name) {
+  const hit = STEP_META.find(([k]) => name.includes(k));
+  return hit ? { tool: hit[1], checks: hit[2] } : { tool: '—', checks: '—' };
+}
+
+function buildReportHtml(scan) {
+  const checkMap = parseChecks(scan.log || []);
+  const checks = Object.entries(checkMap);
+  const isGate2 = checks.some(([n]) => /^L\d|Gate 2/.test(n)) || (scan.findings || []).some((f) => (f.layer || '').includes('Gate 2'));
+  const gate = isGate2 ? 'Gate 2 — AI Security Review' : 'Security Gate';
+  const findings = scan.findings || [];
+  const pass = checks.filter(([, c]) => c.status === 'PASS').length;
+  const fail = checks.filter(([, c]) => ['FAIL', 'ERROR'].includes(c.status)).length;
+  const skip = checks.filter(([, c]) => !['PASS', 'FAIL', 'ERROR'].includes(c.status)).length;
+  const pillCls = (s) => s === 'PASS' ? 'ok' : (['FAIL', 'ERROR'].includes(s) ? 'bad' : 'skip');
+  const sevCls = (s) => ['HIGH', 'CRITICAL'].includes((s || '').toUpperCase()) ? 'bad' : ((s || '').toUpperCase() === 'MEDIUM' ? 'warn' : 'skip');
+  const title = `security-report-scan-${scan.id}`;
+
+  // Severity breakdown + verdict rationale.
+  const sevCount = (s) => findings.filter((f) => (f.severity || '').toUpperCase() === s).length;
+  const crit = sevCount('CRITICAL'), high = sevCount('HIGH'), med = sevCount('MEDIUM'), low = sevCount('LOW');
+  const confirmed = findings.filter((f) => (f.proofStatus || '').toUpperCase() === 'CONFIRMED').length;
+  const blockers = findings.filter((f) => (f.proofStatus || '').toUpperCase() === 'CONFIRMED' && ['HIGH', 'CRITICAL'].includes((f.severity || '').toUpperCase()));
+  const rationale = (scan.verdict === 'BLOCKED')
+    ? `Blocked because ${blockers.length} confirmed HIGH/CRITICAL finding(s): ${blockers.map((f) => esc(f.title)).join('; ') || 'see findings'}.`
+    : (scan.verdict === 'PASS' ? 'Passed — no confirmed HIGH/CRITICAL findings and no integrity failures.' : `Verdict: ${esc(scan.verdict || '—')}.`);
+
+  const stepRows = checks.length ? checks.map(([name, c]) => {
+    const m = stepMeta(name);
+    return `<tr><td>${esc(name)}</td><td>${esc(m.tool)}</td><td>${esc(m.checks)}</td><td><span class="pill ${pillCls(c.status)}">${esc(c.status)}</span></td><td>${esc(c.details || '')}</td></tr>`;
+  }).join('') : `<tr><td colspan="5">No steps were recorded.</td></tr>`;
+
+  const findingCards = findings.length ? findings.map((f, i) => `
+    <div class="finding">
+      <h3><span class="pill ${sevCls(f.severity)}">${esc(f.severity || '—')}</span> ${i + 1}. ${esc(f.title || 'Finding')}</h3>
+      <div class="meta">
+        ${f.layer ? `<b>Source:</b> ${esc(f.layer)} &nbsp;·&nbsp; ` : ''}
+        <b>Location:</b> ${esc(f.file || '—')}${f.line ? ':' + esc(f.line) : ''} &nbsp;·&nbsp;
+        <b>${esc(f.cwe || 'CWE-?')}</b> ${esc(f.owasp || '')} &nbsp;·&nbsp;
+        <b>Proof:</b> ${esc(f.proofStatus || '—')}
+      </div>
+      <p>${esc(f.description || 'No description.')}</p>
+      <div class="ev"><b>Evidence</b><pre>${esc((f.proof || 'Proof pending.').trim())}</pre></div>
+      <div class="fix"><b>Suggested fix:</b> ${esc(f.fix || 'Review the affected code path.')}</div>
+    </div>`).join('') : `<p>No findings were reported for this run.</p>`;
+
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font: 13px/1.5 -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color: #1a1a2e; margin: 32px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 15px; margin: 24px 0 8px; border-bottom: 2px solid #e5e7eb; padding-bottom: 4px; }
+    h3 { font-size: 13px; margin: 0 0 6px; }
+    .sub { color: #6b7280; margin: 0 0 16px; }
+    table { border-collapse: collapse; width: 100%; font-size: 12px; }
+    th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; vertical-align: top; }
+    th { background: #f3f4f6; }
+    .grid { display: grid; grid-template-columns: 140px 1fr; gap: 2px 12px; font-size: 12.5px; margin-bottom: 8px; }
+    .grid b { color: #374151; }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; color: #fff; }
+    .pill.ok { background: #16a34a; } .pill.bad { background: #dc2626; } .pill.warn { background: #d97706; } .pill.skip { background: #9ca3af; }
+    .tally { margin: 4px 0 10px; color: #374151; }
+    .finding { border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 12px; margin: 10px 0; page-break-inside: avoid; }
+    .finding .meta { color: #6b7280; font-size: 11.5px; margin-bottom: 6px; }
+    .ev pre { background: #0b1020; color: #d6e2ff; padding: 8px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; font-size: 11px; overflow: hidden; }
+    .fix { background: #ecfdf5; border-left: 3px solid #16a34a; padding: 6px 8px; border-radius: 4px; }
+    pre.log { background: #0b1020; color: #d6e2ff; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; font-size: 11px; }
+    @media print { body { margin: 12mm; } h2 { page-break-after: avoid; } }
+  </style></head><body>
+    <h1>Security Pipeline Report</h1>
+    <p class="sub">${esc(gate)} · Scan #${esc(scan.id)} · Verdict <b>${esc(scan.verdict || '—')}</b></p>
+    <div class="grid">
+      <b>Repository</b><span>${esc(scan.repoUrl || '—')}</span>
+      <b>Branch</b><span>${esc(scan.branch || '—')}</span>
+      <b>Started</b><span>${esc(scan.createdAt || '—')}</span>
+      <b>Status</b><span>${esc(scan.status || '—')}</span>
+      <b>Verdict</b><span>${esc(scan.verdict || '—')}</span>
+      <b>Summary</b><span>${esc(scan.summary || '—')}</span>
+      <b>Generated</b><span>${esc(new Date().toISOString())}</span>
+    </div>
+
+    <h2>Result summary</h2>
+    <div class="grid">
+      <b>Verdict</b><span><span class="pill ${scan.verdict === 'BLOCKED' ? 'bad' : (scan.verdict === 'PASS' ? 'ok' : 'skip')}">${esc(scan.verdict || '—')}</span></span>
+      <b>Why</b><span>${rationale}</span>
+      <b>Findings</b><span>${findings.length} total · ${confirmed} confirmed</span>
+      <b>By severity</b><span><span class="pill bad">${crit} critical</span> <span class="pill bad">${high} high</span> <span class="pill warn">${med} medium</span> <span class="pill skip">${low} low</span></span>
+      <b>Steps</b><span><span class="pill ok">${pass} passed</span> <span class="pill bad">${fail} failed</span> <span class="pill skip">${skip} skipped/not-run</span></span>
+    </div>
+
+    <h2>Steps performed (${checks.length}) — which tool ran which test</h2>
+    <table><thead><tr><th>Step</th><th>Tool</th><th>What it checks</th><th>Result</th><th>Details</th></tr></thead><tbody>${stepRows}</tbody></table>
+
+    <h2>Findings (${findings.length})</h2>
+    ${findingCards}
+
+    <h2>Full execution log</h2>
+    <pre class="log">${esc((scan.log || []).join('\n'))}</pre>
+  </body></html>`;
+}
+
+function downloadReport() {
+  const scan = selectedScan();
+  if (!scan) { alert('Select a scan run first — click a row under "Recent Scan Runs".'); return; }
+  const html = buildReportHtml(scan);
+  // Render into a hidden iframe and invoke the browser's print dialog → "Save as PDF".
+  const iframe = document.createElement('iframe');
+  iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;';
+  document.body.appendChild(iframe);
+  const doc = iframe.contentWindow.document;
+  doc.open(); doc.write(html); doc.close();
+  const go = () => {
+    try { iframe.contentWindow.focus(); iframe.contentWindow.print(); }
+    catch (e) { alert('Could not open the print dialog: ' + e); }
+    setTimeout(() => iframe.remove(), 2000);
+  };
+  if (iframe.contentWindow.document.readyState === 'complete') setTimeout(go, 50);
+  else iframe.onload = () => setTimeout(go, 50);
+}
+
+$('view-report').addEventListener('click', downloadReport);
 
 /* nav + theme */
 document.querySelectorAll('.nav-item').forEach((item) => item.addEventListener('click', () => {

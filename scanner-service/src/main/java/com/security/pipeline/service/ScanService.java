@@ -6,9 +6,7 @@ import com.security.pipeline.entity.RedTeamFinding;
 import com.security.pipeline.entity.Scan;
 import com.security.pipeline.entity.ServiceEntry;
 import com.security.pipeline.repository.ScanRepository;
-import com.security.pipeline.service.gate1.Gate1Result;
 import com.security.pipeline.service.gate1.Gate1Service;
-import com.security.pipeline.service.gate1.Gate1Tool;
 import com.security.pipeline.service.layer.ReviewLayer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
@@ -194,9 +192,6 @@ public class ScanService {
             scan.setSummary("Running security pipeline checks...");
             appendCheck(scan, "Unit tests", "PENDING", "Waiting to start");
             appendCheck(scan, "Integration tests", "PENDING", "Waiting for review results");
-            for (Gate1Tool tool : gate1Service.getTools()) {
-                appendCheck(scan, "Gate 1 · " + tool.label(), "PENDING", "Waiting to start");
-            }
             if (ripgrepScanner != null) {
                 appendCheck(scan, "Gate 2 · ripgrep (code search)", "PENDING", "Waiting to start");
             }
@@ -242,24 +237,9 @@ public class ScanService {
             scan.getLog().add("Fetched diff with " + diffContext.changedFiles().size() + " changed file(s).");
             scan = self().persist(scan);
 
-            // Gate 1 — run the static-analysis / scanning tools over the checked-out repo. Findings
-            // come from deterministic scanners, so they are recorded as CONFIRMED and can influence
-            // the verdict directly (no LLM proof needed). Tools that are not installed on the host
-            // report UNAVAILABLE and are skipped without failing the scan.
-            for (Gate1Tool tool : gate1Service.getTools()) {
-                if (isCancelled(scanId)) {
-                    markCancelled(scan);
-                    return;
-                }
-
-                Gate1Result result = tool.scan(repoDir);
-                for (Finding f : result.findings()) {
-                    scan.addFinding(f);
-                }
-                appendCheck(scan, "Gate 1 · " + tool.label(), gate1CheckStatus(result), result.summary());
-                scan.getLog().add("Gate 1 " + tool.id() + ": " + result.status() + " - " + result.summary());
-                scan = self().persist(scan);
-            }
+            // Gate 2 runs only Gate-2 checks. The Gate-1 static-analysis/scanning tools (Semgrep,
+            // Gitleaks, osv-scanner, Trivy, Syft, ...) belong to Gate 1 and run via /api/gate1
+            // (LocalGateRunner / GitHub Actions), so they are intentionally not run here.
 
             if (isCancelled(scanId)) {
                 markCancelled(scan);
@@ -442,18 +422,6 @@ public class ScanService {
 
     private String layerCheckName(ReviewLayer layer) {
         return layer.code() + " · " + layer.title();
-    }
-
-    // SKIPPED / UNAVAILABLE render as PENDING rows (with the reason in the detail) so a missing
-    // tool is visible without hard-failing the scan.
-    private String gate1CheckStatus(Gate1Result result) {
-        if (Gate1Result.FAIL.equals(result.status())) {
-            return "FAIL";
-        }
-        if (Gate1Result.PASS.equals(result.status())) {
-            return "PASS";
-        }
-        return "PENDING";
     }
 
     // Runs the red-team DAST probe over the public targets in .secgate/services.yaml, folds the
