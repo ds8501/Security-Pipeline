@@ -32,6 +32,13 @@ public class GitService {
             runCommand(List.of("git", "-C", repoDir.toString(), "fetch", "--quiet", "--no-tags", "origin",
                     safeBase + ":refs/remotes/origin/" + safeBase, safeBranch + ":refs/remotes/origin/" + safeBranch), repoDir, COMMAND_TIMEOUT);
 
+            // Check out the branch entered in the UI (fetched from git) into the working tree, so the
+            // tools that read the working tree — ripgrep, tree-sitter, and the red-team's
+            // .secgate/services.yaml inventory — analyze THAT branch, not the clone's default branch
+            // or the scanner-service's own running branch.
+            runCommand(List.of("git", "-C", repoDir.toString(), "checkout", "--quiet", "--force",
+                    "-B", safeBranch, "origin/" + safeBranch), repoDir, COMMAND_TIMEOUT);
+
             String rawDiff = runCommand(List.of("git", "-C", repoDir.toString(), "diff", "origin/" + safeBase + "...origin/" + safeBranch), repoDir, COMMAND_TIMEOUT);
             String nameOnly = runCommand(List.of("git", "-C", repoDir.toString(), "diff", "--name-only", "origin/" + safeBase + "...origin/" + safeBranch), repoDir, COMMAND_TIMEOUT);
 
