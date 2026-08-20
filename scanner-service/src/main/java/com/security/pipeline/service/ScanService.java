@@ -233,7 +233,18 @@ public class ScanService {
 
             DiffContext diffContext = gitService.fetchDiff(scan.getRepoUrl(), scan.getBranch(), baseBranch);
             repoDir = diffContext.repoDir();
-            appendCheck(scan, "Integration tests", "PASS", "Repository diff loaded successfully");
+
+             if (repoDir == null) {
+                appendCheck(scan, "Integration tests", "FAIL", "Could not clone/fetch the repository");
+                scan.setStatus("error");
+                scan.setVerdict("ERROR");
+                scan.setSummary("Could not load the repository. Check the repo URL and branch — a private repo needs credentials (SSH, or a token in the URL), or use a local full clone path.");
+                scan.getLog().add("ERROR: git clone/fetch failed for " + scan.getRepoUrl() + " (branch " + scan.getBranch() + " / base " + baseBranch + ").");
+                scan = self().persist(scan);
+                return;
+            }
+
+            appendCheck(scan, "Integration tests", "PASS", "Repository diff loaded (" + diffContext.changedFiles().size() + " changed file(s))");
             scan.getLog().add("Fetched diff with " + diffContext.changedFiles().size() + " changed file(s).");
             scan = self().persist(scan);
 

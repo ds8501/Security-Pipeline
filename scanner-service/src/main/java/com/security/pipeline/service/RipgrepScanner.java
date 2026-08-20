@@ -37,7 +37,9 @@ public class RipgrepScanner {
             new Hotspot("\\beval\\s*\\(|\\bexec\\s*\\(", "Dynamic code execution", "MEDIUM", "CWE-95"),
             new Hotspot("pickle\\.loads|yaml\\.load\\s*\\(|readObject\\s*\\(", "Unsafe deserialization", "MEDIUM", "CWE-502"),
             new Hotspot("(?i)verify\\s*=\\s*False|InsecureSkipVerify|TrustAllCerts|ALLOW_ALL_HOSTNAME", "Disabled TLS verification", "MEDIUM", "CWE-295"),
-            new Hotspot("(?i)MD5|SHA1(?![0-9])|DES\\b|RC4|ECB", "Weak cryptographic primitive", "LOW", "CWE-327")
+            // NOTE: ripgrep's default (Rust regex) engine has no look-around, so avoid it here —
+            // a single unsupported pattern makes rg error out and drop ALL matches.
+            new Hotspot("(?i)\\bMD5\\b|\\bSHA-?1\\b|\\bDES\\b|\\bRC4\\b|\\bECB\\b", "Weak cryptographic primitive", "LOW", "CWE-327")
     );
 
     private record Hotspot(String regex, String title, String severity, String cwe) {
