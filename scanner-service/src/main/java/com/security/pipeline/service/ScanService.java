@@ -234,13 +234,11 @@ public class ScanService {
             DiffContext diffContext = gitService.fetchDiff(scan.getRepoUrl(), scan.getBranch(), baseBranch);
             repoDir = diffContext.repoDir();
 
-            // A null repoDir means the clone/fetch failed (unreachable or private repo without
-            // credentials). Fail closed with a clear error instead of silently passing an empty diff.
-            if (repoDir == null) {
+             if (repoDir == null) {
                 appendCheck(scan, "Integration tests", "FAIL", "Could not clone/fetch the repository");
                 scan.setStatus("error");
                 scan.setVerdict("ERROR");
-                scan.setSummary("Could not load the repository. Check the repo URL and branch — a private repo needs credentials (a token in the URL), or use a local path.");
+                scan.setSummary("Could not load the repository. Check the repo URL and branch — a private repo needs credentials (SSH, or a token in the URL), or use a local full clone path.");
                 scan.getLog().add("ERROR: git clone/fetch failed for " + scan.getRepoUrl() + " (branch " + scan.getBranch() + " / base " + baseBranch + ").");
                 scan = self().persist(scan);
                 return;

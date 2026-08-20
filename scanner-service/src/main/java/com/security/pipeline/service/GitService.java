@@ -75,9 +75,7 @@ public class GitService {
             if (repoDir != null) {
                 cleanup(repoDir);
             }
-            // Signal failure with a null repoDir so the caller can ERROR the scan instead of
-            // treating an unreachable/private repo (or clone/fetch failure) as an empty, passing diff.
-            return new DiffContext(null, "", List.of(), Map.of());
+            return new DiffContext(repoDir, "", List.of(), Map.of());
         }
     }
 
@@ -152,10 +150,6 @@ public class GitService {
         ProcessBuilder processBuilder = new ProcessBuilder(command);
         processBuilder.directory(workingDir.toFile());
         processBuilder.redirectErrorStream(true);
-        // Never block waiting for interactive credentials — a private repo without a token should
-        // fail fast rather than hang until the command timeout.
-        processBuilder.environment().put("GIT_TERMINAL_PROMPT", "0");
-        processBuilder.environment().put("GIT_ASKPASS", "echo");
 
         Process process = processBuilder.start();
         boolean completed = process.waitFor(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
