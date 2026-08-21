@@ -27,7 +27,9 @@ public class GitHubActionsClient {
             .build();
     private final ObjectMapper mapper = new ObjectMapper();
 
-    @Value("${gate1.github.token:}")
+    // Falls back to the shared GITHUB_TOKEN so a single Render env var powers both
+    // Gate-1 dispatch and the repo/branch pickers.
+    @Value("${gate1.github.token:${secgate.github-token:${GITHUB_TOKEN:}}}")
     private String token;
 
     @Value("${gate1.github.repo:}")

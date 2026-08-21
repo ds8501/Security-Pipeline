@@ -5,6 +5,12 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:        # lets the scanner-service dispatch Gate 1 on demand (github mode)
+    inputs:
+      ref:
+        description: Branch or ref to scan
+        required: false
+        default: main
 
 permissions:
   contents: read
