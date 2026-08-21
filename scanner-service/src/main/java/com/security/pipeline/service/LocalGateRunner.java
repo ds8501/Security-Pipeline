@@ -20,7 +20,7 @@ import java.util.stream.Stream;
 @Component
 public class LocalGateRunner {
 
-    private record Tool(String name, List<String> command, boolean atRepoRoot) {
+    private record Tool(String name, List<String> command, boolean atRepoRoot, int timeoutSeconds) {
     }
 
     public void run(Gate1Run gate) {
@@ -39,18 +39,18 @@ public class LocalGateRunner {
 
             Path pom = findPom(repoDir);
             List<Tool> tools = List.of(
-                    new Tool("Unit tests & coverage",
-                            pom == null ? null : List.of("mvn", "-q", "-B", "-f", pom.toString(), "test"), false),
+                    // generous timeout: the first wrapper run downloads Maven and all dependencies
+                    new Tool("Unit tests & coverage", mavenCommand(pom), false, 900),
                     new Tool("Code sanity & crypto (Semgrep)",
-                            List.of("semgrep", "scan", "--error", "--quiet", "--config", "p/security-audit", "."), true),
+                            List.of("semgrep", "scan", "--error", "--quiet", "--config", "p/security-audit", "."), true, 300),
                     new Tool("Secret leak (Gitleaks)",
-                            List.of("gitleaks", "detect", "--source", ".", "--no-banner", "--redact"), true),
+                            List.of("gitleaks", "detect", "--source", ".", "--no-banner", "--redact"), true, 300),
                     new Tool("Vulnerable dependencies (osv-scanner)",
-                            List.of("osv-scanner", "scan", "-r", "."), true),
+                            List.of("osv-scanner", "scan", "-r", "."), true, 300),
                     new Tool("Infra & container config (Trivy)",
-                            List.of("trivy", "config", "--quiet", "."), true),
+                            List.of("trivy", "config", "--quiet", "."), true, 300),
                     new Tool("SBOM (Syft)",
-                            List.of("syft", "scan", "dir:.", "-o", "cyclonedx-json"), true)
+                            List.of("syft", "scan", "dir:.", "-o", "cyclonedx-json"), true, 300)
             );
 
             boolean blocked = false;
@@ -66,7 +66,7 @@ public class LocalGateRunner {
                 check.setStatus("running");
                 Path workDir = tool.atRepoRoot() ? repoDir : repoDir;
                 try {
-                    ExecResult res = exec(tool.command(), workDir, 300);
+                    ExecResult res = exec(tool.command(), workDir, tool.timeoutSeconds());
                     check.setStatus("completed");
                     if (res.exitCode() == 0) {
                         check.setConclusion("success");
@@ -112,6 +112,26 @@ public class LocalGateRunner {
             return new ExecResult(124, out + "\n(timed out)");
         }
         return new ExecResult(p.exitValue(), out);
+    }
+
+    /**
+     * Prefers the Maven wrapper checked in next to the pom (works on hosts without a system
+     * mvn — the wrapper bootstraps its own Maven) and falls back to the system install.
+     */
+    private List<String> mavenCommand(Path pom) {
+        if (pom == null) {
+            return null;
+        }
+        Path parent = pom.getParent();
+        Path wrapper = parent != null ? parent.resolve("mvnw") : null;
+        if (wrapper != null && Files.isRegularFile(wrapper)) {
+            // git preserves the exec bit, but be defensive about checkouts that don't
+            if (!Files.isExecutable(wrapper)) {
+                wrapper.toFile().setExecutable(true);
+            }
+            return List.of(wrapper.toAbsolutePath().toString(), "-q", "-B", "-f", pom.toString(), "test");
+        }
+        return List.of("mvn", "-q", "-B", "-f", pom.toString(), "test");
     }
 
     private Path findPom(Path repoDir) {

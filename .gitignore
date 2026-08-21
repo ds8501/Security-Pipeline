@@ -5,3 +5,4 @@ target/
 *.class
 .DS_Store
 npm-debug.log*
+**/.mvn/wrapper/maven-wrapper.jar
