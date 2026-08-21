@@ -96,8 +96,9 @@ jobs:
   # ---------------------------------------------------------------------------
   dependencies:
     name: Vulnerable dependencies (osv-scanner)
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v1.9.2
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.5.0
     permissions:
+      actions: read            # required by the reusable workflow (else startup_failure)
       contents: read
       security-events: write
     with:
