@@ -93,6 +93,13 @@ public class ScanService {
         return scan;
     }
 
+    /** Clears all scan history (and their findings, via cascade). Used by the UI's "Clear runs". */
+    @Transactional
+    public void clearScans() {
+        scanRepository.deleteAll();
+        cancellationFlags.clear();
+    }
+
     // Falls back to `this` for the plain-constructor test path where no Spring proxy exists.
     private ScanService self() {
         return self != null ? self : this;

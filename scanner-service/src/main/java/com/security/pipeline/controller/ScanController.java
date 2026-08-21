@@ -4,6 +4,7 @@ import com.security.pipeline.entity.Scan;
 import com.security.pipeline.service.ScanService;
 import jakarta.validation.Valid;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -30,6 +31,13 @@ public class ScanController {
     @GetMapping("/scans")
     public List<Scan> getScans() {
         return scanService.getScans();
+    }
+
+    /** Clears all scan history (the UI's "Clear runs" button). */
+    @DeleteMapping("/scans")
+    public ResponseEntity<Void> clearScans() {
+        scanService.clearScans();
+        return ResponseEntity.noContent().build();
     }
 
     @GetMapping("/scans/{id}")
