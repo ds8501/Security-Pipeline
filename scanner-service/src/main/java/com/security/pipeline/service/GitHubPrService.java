@@ -116,12 +116,71 @@ public class GitHubPrService {
         }
     }
 
+    /** A repository the UI can pick from: its {@code owner/repo} slug and clone URL. */
+    public record RepoInfo(String fullName, String url) {
+    }
+
+    /**
+     * Lists repositories the configured token can see (owner, collaborator, org member), newest first.
+     * Returns an empty list when no token is configured or the call fails — the UI degrades to free-text.
+     */
+    public java.util.List<RepoInfo> listRepos() {
+        if (!isConfigured()) {
+            return java.util.List.of();
+        }
+        try {
+            JsonNode arr = api("GET", apiBase
+                    + "/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member", null);
+            java.util.List<RepoInfo> out = new java.util.ArrayList<>();
+            if (arr.isArray()) {
+                for (JsonNode r : arr) {
+                    String full = r.path("full_name").asText(null);
+                    String clone = r.path("clone_url").asText(null);
+                    if (full != null && clone != null) {
+                        out.add(new RepoInfo(full, clone));
+                    }
+                }
+            }
+            return out;
+        } catch (Exception e) {
+            return java.util.List.of();
+        }
+    }
+
+    /**
+     * Lists branch names for {@code repoUrl}. Works for public repos without a token; uses the token
+     * for private ones. Returns an empty list on any error so the UI can fall back to typing a branch.
+     */
+    public java.util.List<String> listBranches(String repoUrl) {
+        String slug = ownerRepo(repoUrl);
+        if (slug == null) {
+            return java.util.List.of();
+        }
+        try {
+            JsonNode arr = api("GET", apiBase + "/repos/" + slug + "/branches?per_page=100", null);
+            java.util.List<String> out = new java.util.ArrayList<>();
+            if (arr.isArray()) {
+                for (JsonNode br : arr) {
+                    String name = br.path("name").asText(null);
+                    if (name != null) {
+                        out.add(name);
+                    }
+                }
+            }
+            return out;
+        } catch (Exception e) {
+            return java.util.List.of();
+        }
+    }
+
     private JsonNode api(String method, String url, JsonNode body) throws Exception {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
-                .header("Authorization", "Bearer " + token)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .timeout(Duration.ofSeconds(30));
+        if (token != null && !token.isBlank()) {
+            b.header("Authorization", "Bearer " + token);
+        }
         if ("GET".equals(method)) {
             b.GET();
         } else {
