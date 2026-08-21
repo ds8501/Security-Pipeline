@@ -1,0 +1,29 @@
+package com.security.pipeline.service.gate1;
+
+import org.springframework.stereotype.Service;
+
+import java.util.Comparator;
+import java.util.List;
+
+/**
+ * Holds the Gate-1 static-analysis tools in execution order. The scan pipeline iterates these
+ * before the Gate-2 AI layers so that a single run covers both gates (tests/scanning first, then
+ * the AI red-team review).
+ */
+// Distinct bean name so it coexists with the legacy com.security.pipeline.service.Gate1Service
+// (which backs the /api/gate1 UI endpoints); this one is injected by type, not name.
+@Service("gate1ToolService")
+public class Gate1Service {
+    private final List<Gate1Tool> tools;
+
+    public Gate1Service(List<Gate1Tool> tools) {
+        this.tools = tools == null ? List.of() : tools.stream()
+                .sorted(Comparator.comparingInt(Gate1Tool::order))
+                .toList();
+    }
+
+    /** The Gate-1 tools in execution order. */
+    public List<Gate1Tool> getTools() {
+        return tools;
+    }
+}

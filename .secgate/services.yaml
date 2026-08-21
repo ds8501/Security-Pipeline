@@ -1,0 +1,10 @@
+# Attack-surface inventory for the security pipeline.
+# The red team (Gate 2 / DAST) probes ONLY services marked exposure: public.
+# Private services are documented here but are out of scope for internet-facing attacks.
+services:
+  - name: scanner-service-api
+    exposure: public
+    url: http://localhost:8080
+  - name: internal-db
+    exposure: private
+    url: http://127.0.0.1:5432

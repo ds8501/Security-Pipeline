@@ -1,0 +1,187 @@
+name: Security Pipeline Gate 1
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write   # required to upload SARIF to GitHub code scanning
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Tests, coverage, SAST and secret scanning
+  # ---------------------------------------------------------------------------
+  test-and-scan:
+    runs-on: ubuntu-latest
+    name: Security Gate 1 - Tests & Scanning
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # diff-cover needs history to compare against the base branch
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run Maven tests (with JaCoCo coverage)
+        working-directory: ./scanner-service
+        run: mvn -Pcoverage test
+
+      # Coverage — JaCoCo produces the XML report; diff-cover reports coverage on changed lines.
+      - name: Coverage on changed lines (diff-cover)
+        run: |
+          python3 -m pip install --quiet diff-cover
+          BASE="${{ github.base_ref || 'main' }}"
+          git fetch --quiet origin "$BASE" || true
+          diff-cover scanner-service/target/site/jacoco/jacoco.xml \
+            --compare-branch "origin/$BASE" \
+            --html-report diff-cover.html \
+            --fail-under=0 || true
+
+      - name: Install Semgrep
+        run: python3 -m pip install --quiet semgrep
+
+      - name: Semgrep scan (SARIF)
+        run: |
+          semgrep --config=p/security-audit \
+            --sarif --output=semgrep.sarif \
+            scanner-service/src/main/java || true
+
+      - name: Upload Semgrep SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Fail on critical Semgrep findings
+        run: |
+          if [ -f semgrep.sarif ]; then
+            ERRORS=$(jq '[.runs[].results[]? | select(.level == "error")] | length' semgrep.sarif || echo 0)
+            if [ "$ERRORS" -gt 0 ]; then
+              echo "❌ Found $ERRORS error-level Semgrep issues"
+              exit 1
+            fi
+          fi
+
+      - name: Gitleaks secret scan
+        run: |
+          docker run --rm -v "$(pwd):/repo" zricethezav/gitleaks:latest \
+            detect --source /repo --report-path /repo/gitleaks-results.json --exit-code 0 || true
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate1-scan-results
+          path: |
+            semgrep.sarif
+            gitleaks-results.json
+            diff-cover.html
+
+  # ---------------------------------------------------------------------------
+  # Vulnerable dependencies (osv-scanner reusable workflow, uploads its own SARIF)
+  # ---------------------------------------------------------------------------
+  dependencies:
+    name: Vulnerable dependencies (osv-scanner)
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v1.9.2
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      scan-args: |-
+        -r
+        --skip-git
+        ./
+
+  # ---------------------------------------------------------------------------
+  # Infra / container config scanning + SBOM
+  # ---------------------------------------------------------------------------
+  infra-and-sbom:
+    runs-on: ubuntu-latest
+    name: Infra config (Trivy) & SBOM (Syft)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan (vuln + misconfig + secret)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scanners: vuln,misconfig,secret
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      - name: Upload Trivy SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Generate SBOM (Syft, CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: sbom.cdx.json
+
+  # ---------------------------------------------------------------------------
+  # Pipeline hardening (workflow linting + security audit)
+  # ---------------------------------------------------------------------------
+  pipeline-hardening:
+    runs-on: ubuntu-latest
+    name: Pipeline hardening (actionlint + zizmor)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: actionlint (workflow linting)
+        uses: raven-actions/actionlint@v2
+
+      - name: Install zizmor
+        run: python3 -m pip install --quiet zizmor
+
+      - name: Run zizmor (SARIF)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: zizmor --format sarif .github/workflows > zizmor.sarif || true
+
+      - name: Upload zizmor SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+  # ---------------------------------------------------------------------------
+  # Build the service jar
+  # ---------------------------------------------------------------------------
+  build-service:
+    runs-on: ubuntu-latest
+    name: Build Service
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Build scanner-service
+        working-directory: ./scanner-service
+        run: mvn clean package -DskipTests
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanner-service-jar
+          path: scanner-service/target/*.jar

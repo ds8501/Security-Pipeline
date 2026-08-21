@@ -1,0 +1,8 @@
+node_modules/
+target/
+.idea/
+.env
+*.class
+.DS_Store
+npm-debug.log*
+**/.mvn/wrapper/maven-wrapper.jar
