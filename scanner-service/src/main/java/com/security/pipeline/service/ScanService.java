@@ -52,6 +52,8 @@ public class ScanService {
     private RedTeamService redTeamService;
     @Autowired(required = false)
     private ServiceInventory serviceInventory;
+    @Autowired(required = false)
+    private AdversarialVerifier adversarialVerifier;
 
     public ScanService(ScanRepository scanRepository) {
         this(scanRepository, null, null, null, null, new ClaudeClient(), null);
@@ -333,6 +335,36 @@ public class ScanService {
                 if (isCancelled(scanId)) {
                     markCancelled(scan);
                     return;
+                }
+
+                // Prove-or-drop: an adversarial judge refutes each AI finding, dropping false positives
+                // and downgrading unreachable ones — so only real, exploitable issues survive.
+                if (adversarialVerifier != null && adversarialVerifier.isEnabled()) {
+                    List<Finding> aiFindings = unprovenFindings(scan);
+                    List<Finding> toDrop = new ArrayList<>();
+                    int kept = 0, downgraded = 0;
+                    for (Finding f : aiFindings) {
+                        AdversarialVerifier.Verdict v = adversarialVerifier.verify(f, diffContext);
+                        switch (v.decision()) {
+                            case DROP -> toDrop.add(f);
+                            case DOWNGRADE -> {
+                                f.setSeverity("LOW");
+                                f.setDescription(f.getDescription() + "  [Adversarial: downgraded — " + v.rationale() + "]");
+                                downgraded++;
+                            }
+                            default -> {
+                                f.setDescription(f.getDescription() + "  [Adversarial: confirmed"
+                                        + (v.exploitable() ? " (exploitable)" : "") + " — " + v.rationale() + "]");
+                                kept++;
+                            }
+                        }
+                    }
+                    scan.getFindings().removeAll(toDrop);
+                    appendCheck(scan, "Gate 2 · Adversarial verify", "PASS",
+                            kept + " kept, " + downgraded + " downgraded, " + toDrop.size() + " dropped (false positives)");
+                    scan.getLog().add("Adversarial verification: " + kept + " kept, " + downgraded
+                            + " downgraded, " + toDrop.size() + " dropped.");
+                    scan = self().persist(scan);
                 }
 
                 // Gate 2 · proof — only the AI findings need Semgrep proof; Gate-1 scanner findings are

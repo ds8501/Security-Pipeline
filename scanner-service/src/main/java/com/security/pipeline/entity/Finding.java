@@ -1,159 +1,1 @@
-package com.security.pipeline.entity;
-
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.FetchType;
-import jakarta.persistence.GeneratedValue;
-import jakarta.persistence.GenerationType;
-import jakarta.persistence.Id;
-import jakarta.persistence.JoinColumn;
-import jakarta.persistence.ManyToOne;
-import jakarta.persistence.Table;
-import com.fasterxml.jackson.annotation.JsonIgnore;
-
-@Entity
-@Table(name = "findings")
-public class Finding {
-    @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
-    private Long id;
-
-    @Column(nullable = false)
-    private String title;
-
-    @Column(nullable = false)
-    private String severity;
-
-    @Column(nullable = false)
-    private String file;
-
-    private Integer line;
-
-    @Column(length = 4000)
-    private String description;
-
-    @Column(length = 4000)
-    private String proof;
-
-    @Column(length = 4000)
-    private String fix;
-
-    private String cwe;
-
-    private String owasp;
-
-    // Which Gate-2 review layer produced this finding (e.g. "L2"). Null for legacy/manual findings.
-    private String layer;
-
-    @Column(nullable = false)
-    private String proofStatus = "UNPROVEN";
-
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "scan_id", nullable = false)
-    @JsonIgnore
-    private Scan scan;
-
-    public Long getId() {
-        return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
-    }
-
-    public String getTitle() {
-        return title;
-    }
-
-    public void setTitle(String title) {
-        this.title = title;
-    }
-
-    public String getSeverity() {
-        return severity;
-    }
-
-    public void setSeverity(String severity) {
-        this.severity = severity;
-    }
-
-    public String getFile() {
-        return file;
-    }
-
-    public void setFile(String file) {
-        this.file = file;
-    }
-
-    public Integer getLine() {
-        return line;
-    }
-
-    public void setLine(Integer line) {
-        this.line = line;
-    }
-
-    public String getDescription() {
-        return description;
-    }
-
-    public void setDescription(String description) {
-        this.description = description;
-    }
-
-    public String getProof() {
-        return proof;
-    }
-
-    public void setProof(String proof) {
-        this.proof = proof;
-    }
-
-    public String getFix() {
-        return fix;
-    }
-
-    public void setFix(String fix) {
-        this.fix = fix;
-    }
-
-    public String getCwe() {
-        return cwe;
-    }
-
-    public void setCwe(String cwe) {
-        this.cwe = cwe;
-    }
-
-    public String getOwasp() {
-        return owasp;
-    }
-
-    public void setOwasp(String owasp) {
-        this.owasp = owasp;
-    }
-
-    public String getProofStatus() {
-        return proofStatus;
-    }
-
-    public void setProofStatus(String proofStatus) {
-        this.proofStatus = proofStatus;
-    }
-
-    public String getLayer() {
-        return layer;
-    }
-
-    public void setLayer(String layer) {
-        this.layer = layer;
-    }
-
-    public Scan getScan() {
-        return scan;
-    }
-
-    public void setScan(Scan scan) {
-        this.scan = scan;
-    }
-}
+package com.security.pipeline.entity;import jakarta.persistence.Column;import jakarta.persistence.Entity;import jakarta.persistence.FetchType;import jakarta.persistence.GeneratedValue;import jakarta.persistence.GenerationType;import jakarta.persistence.Id;import jakarta.persistence.JoinColumn;import jakarta.persistence.ManyToOne;import jakarta.persistence.Table;import com.fasterxml.jackson.annotation.JsonIgnore;@Entity@Table(name = "findings")public class Finding {    @Id    @GeneratedValue(strategy = GenerationType.IDENTITY)    private Long id;    @Column(nullable = false)    private String title;    @Column(nullable = false)    private String severity;    @Column(nullable = false)    private String file;    private Integer line;    @Column(length = 4000)    private String description;    @Column(length = 4000)    private String proof;    @Column(length = 4000)    private String fix;    // Auto-generated remediation patch (unified diff) for this finding, used by the auto-fix PR.    @Column(length = 8000)    private String patch;    private String cwe;    private String owasp;    // Which Gate-2 review layer produced this finding (e.g. "L2"). Null for legacy/manual findings.    private String layer;    @Column(nullable = false)    private String proofStatus = "UNPROVEN";    @ManyToOne(fetch = FetchType.LAZY)    @JoinColumn(name = "scan_id", nullable = false)    @JsonIgnore    private Scan scan;    public Long getId() {        return id;    }    public void setId(Long id) {        this.id = id;    }    public String getTitle() {        return title;    }    public void setTitle(String title) {        this.title = title;    }    public String getSeverity() {        return severity;    }    public void setSeverity(String severity) {        this.severity = severity;    }    public String getFile() {        return file;    }    public void setFile(String file) {        this.file = file;    }    public Integer getLine() {        return line;    }    public void setLine(Integer line) {        this.line = line;    }    public String getDescription() {        return description;    }    public void setDescription(String description) {        this.description = description;    }    public String getProof() {        return proof;    }    public void setProof(String proof) {        this.proof = proof;    }    public String getFix() {        return fix;    }    public void setFix(String fix) {        this.fix = fix;    }    public String getCwe() {        return cwe;    }    public void setCwe(String cwe) {        this.cwe = cwe;    }    public String getOwasp() {        return owasp;    }    public void setOwasp(String owasp) {        this.owasp = owasp;    }    public String getProofStatus() {        return proofStatus;    }    public void setProofStatus(String proofStatus) {        this.proofStatus = proofStatus;    }    public String getPatch() {        return patch;    }    public void setPatch(String patch) {        this.patch = patch;    }    public String getLayer() {        return layer;    }    public void setLayer(String layer) {        this.layer = layer;    }    public Scan getScan() {        return scan;    }    public void setScan(Scan scan) {        this.scan = scan;    }}

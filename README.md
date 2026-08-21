@@ -131,3 +131,20 @@ Each tool/layer appears as its own row in the live status view. Configure tool b
 7. Fix issues and push again - gates run automatically on update
 
 The workflow follows the proposal: Gate 1 is fast and broad (tests, basic scanning), Gate 2 is deep and AI-powered (permission checks, data protection, etc.).
+
+## What makes this different (enterprise differentiators)
+
+Beyond the standard gates, the pipeline adds four capabilities most CI security tools lack:
+
+1. **Prove-or-drop adversarial verification** (`AdversarialVerifier`) — every AI finding faces an
+   independent skeptic agent that tries to *refute* it. False positives are **dropped**, unreachable
+   issues **downgraded**, and only real, exploitable findings survive. Kills false-positive fatigue.
+2. **Auto-fix pull requests** (`AutoFixService` + `GitHubPrService`, `POST /api/scans/{id}/autofix-pr`)
+   — generates the corrected code and **opens a PR** with the fix (when `GITHUB_TOKEN` is set),
+   otherwise returns the patches. Find → prove → **fix**.
+3. **AI / LLM application security layer** (`AiSecurityLayer`, `L7`) — reviews the AI features teams
+   now ship for prompt-injection sinks, insecure model-output handling, secrets in prompts, and
+   excessive tool/agent agency (OWASP LLM Top 10). Few tools cover this.
+4. **Signed supply-chain attestations** (`AttestationService`, `GET /api/scans/{id}/attestation`,
+   `POST /api/attestation/verify`) — signs each verdict into a DSSE-style, in-toto attestation. A
+   deploy gate can require a **valid, signed `PASS`** before promotion — tamper-proof (no key, no deploy).
