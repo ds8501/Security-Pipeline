@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: security-pipeline-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    autoDeploy: true

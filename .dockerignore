@@ -1,0 +1,10 @@
+.git
+.github
+.idea
+.vscode
+.secgate
+**/target
+**/node_modules
+*.log
+.env
+README.md
