@@ -49,10 +49,9 @@ public class LocalGateRunner {
             Path pom = findPom(repoDir);
             // Fast scanners run always; heavy tools (mvn test, Trivy) only when explicitly enabled.
             List<Tool> tools = new ArrayList<>();
-            if (heavyTools) {
-                // generous timeout: the first wrapper run downloads Maven and all dependencies
-                tools.add(new Tool("Unit tests & coverage", mavenCommand(pom), false, 900));
-            }
+            // Unit tests & coverage always run in Gate 1. generous timeout: the first run
+            // downloads Maven and all dependencies.
+            tools.add(new Tool("Unit tests & coverage", mavenCommand(pom), false, 900));
             tools.add(new Tool("Code sanity & crypto (Semgrep)",
                     // --max-memory + single job keep Semgrep within a 512MB host's budget
                     List.of("semgrep", "scan", "--error", "--quiet", "--jobs", "1", "--max-memory", "300",
@@ -119,6 +118,8 @@ public class LocalGateRunner {
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.directory(workDir.toFile());
         pb.redirectErrorStream(true);
+        // Cap Maven's own JVM so the mvn test step fits alongside the service on a 512MB host.
+        pb.environment().putIfAbsent("MAVEN_OPTS", "-Xmx256m");
         Process p = pb.start();               // throws IOException if the binary is missing
         String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         boolean done = p.waitFor(timeoutSeconds, TimeUnit.SECONDS);
@@ -144,9 +145,10 @@ public class LocalGateRunner {
             if (!Files.isExecutable(wrapper)) {
                 wrapper.toFile().setExecutable(true);
             }
-            return List.of(wrapper.toAbsolutePath().toString(), "-q", "-B", "-f", pom.toString(), "test");
+            return List.of(wrapper.toAbsolutePath().toString(), "-q", "-B", "-DforkCount=0", "-f", pom.toString(), "test");
         }
-        return List.of("mvn", "-q", "-B", "-f", pom.toString(), "test");
+        // -DforkCount=0 runs tests in the Maven JVM (no extra forked JVM) to fit small hosts.
+        return List.of("mvn", "-q", "-B", "-DforkCount=0", "-f", pom.toString(), "test");
     }
 
     private Path findPom(Path repoDir) {
