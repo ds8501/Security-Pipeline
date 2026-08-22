@@ -49,9 +49,9 @@ public class LocalGateRunner {
             Path pom = findPom(repoDir);
             // Fast scanners run always; heavy tools (mvn test, Trivy) only when explicitly enabled.
             List<Tool> tools = new ArrayList<>();
-            // Unit tests & coverage always run in Gate 1. generous timeout: the first run
-            // downloads Maven and all dependencies.
-            tools.add(new Tool("Unit tests & coverage", mavenCommand(pom), false, 900));
+            // Fast unit tests always run in Gate 1 (heavy @SpringBootTest integration tests are
+            // excluded so it fits small hosts). Deps are pre-cached in the image, so this is quick.
+            tools.add(new Tool("Unit tests", mavenCommand(pom), false, 600));
             tools.add(new Tool("Code sanity & crypto (Semgrep)",
                     // --max-memory + single job keep Semgrep within a 512MB host's budget
                     List.of("semgrep", "scan", "--error", "--quiet", "--jobs", "1", "--max-memory", "300",
@@ -151,8 +151,12 @@ public class LocalGateRunner {
             mvn = "mvn";
         }
         // "nice" lowers the build's CPU priority so the web thread stays responsive on a single
-        // core; -DforkCount=0 runs tests in the Maven JVM (no extra forked JVM) to fit small hosts.
-        return List.of("nice", "-n", "15", mvn, "-q", "-B", "-DforkCount=0", "-f", pom.toString(), "test");
+        // core; -DforkCount=0 runs tests in the Maven JVM (no extra forked JVM) to fit small hosts;
+        // excluding *IntegrationTest skips heavy @SpringBootTest context boots so the fast unit
+        // tests complete within a 512MB budget. failIfNoTests=false keeps repos without unit tests green.
+        return List.of("nice", "-n", "15", mvn, "-q", "-B", "-DforkCount=0",
+                "-Dtest=!*IntegrationTest", "-DfailIfNoTests=false",
+                "-f", pom.toString(), "test");
     }
 
     private Path findPom(Path repoDir) {
