@@ -47,7 +47,10 @@ public class Gate1Service {
 
         String mode = request.modeOrAuto();
         if ("auto".equals(mode)) {
-            mode = (github.hasToken() && repo != null) ? "github" : "local";
+            // Run the tools in-process (the API version). Use mode=github explicitly to
+            // dispatch the GitHub Actions workflow instead. Fall back to github only when
+            // no repoUrl is available for a local clone.
+            mode = (repoUrl != null) ? "local" : (github.hasToken() && repo != null ? "github" : "local");
         }
 
         Gate1Run run = new Gate1Run();
