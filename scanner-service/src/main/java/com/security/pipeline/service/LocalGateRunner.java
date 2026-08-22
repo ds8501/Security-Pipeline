@@ -140,15 +140,19 @@ public class LocalGateRunner {
         }
         Path parent = pom.getParent();
         Path wrapper = parent != null ? parent.resolve("mvnw") : null;
+        String mvn;
         if (wrapper != null && Files.isRegularFile(wrapper)) {
             // git preserves the exec bit, but be defensive about checkouts that don't
             if (!Files.isExecutable(wrapper)) {
                 wrapper.toFile().setExecutable(true);
             }
-            return List.of(wrapper.toAbsolutePath().toString(), "-q", "-B", "-DforkCount=0", "-f", pom.toString(), "test");
+            mvn = wrapper.toAbsolutePath().toString();
+        } else {
+            mvn = "mvn";
         }
-        // -DforkCount=0 runs tests in the Maven JVM (no extra forked JVM) to fit small hosts.
-        return List.of("mvn", "-q", "-B", "-DforkCount=0", "-f", pom.toString(), "test");
+        // "nice" lowers the build's CPU priority so the web thread stays responsive on a single
+        // core; -DforkCount=0 runs tests in the Maven JVM (no extra forked JVM) to fit small hosts.
+        return List.of("nice", "-n", "15", mvn, "-q", "-B", "-DforkCount=0", "-f", pom.toString(), "test");
     }
 
     private Path findPom(Path repoDir) {

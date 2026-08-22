@@ -36,6 +36,10 @@ RUN set -eux; \
     curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin; \
     gitleaks version && osv-scanner --version && syft version && trivy --version && semgrep --version && mvn -v
 
+# Pre-populated Maven repo from the build stage: when Gate 1 runs "mvn test" on
+# this project, its dependencies are already local, so no slow first-run download.
+COPY --from=build /root/.m2 /root/.m2
+
 WORKDIR /app
 COPY --from=build /workspace/scanner-service/target/scanner-service-*.jar /app/app.jar
 
