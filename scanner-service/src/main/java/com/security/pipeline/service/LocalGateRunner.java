@@ -54,7 +54,9 @@ public class LocalGateRunner {
                 tools.add(new Tool("Unit tests & coverage", mavenCommand(pom), false, 900));
             }
             tools.add(new Tool("Code sanity & crypto (Semgrep)",
-                    List.of("semgrep", "scan", "--error", "--quiet", "--config", "p/security-audit", "."), true, 300));
+                    // --max-memory + single job keep Semgrep within a 512MB host's budget
+                    List.of("semgrep", "scan", "--error", "--quiet", "--jobs", "1", "--max-memory", "300",
+                            "--config", "p/security-audit", "."), true, 300));
             tools.add(new Tool("Secret leak (Gitleaks)",
                     List.of("gitleaks", "detect", "--source", ".", "--no-banner", "--redact"), true, 300));
             tools.add(new Tool("Vulnerable dependencies (osv-scanner)",
