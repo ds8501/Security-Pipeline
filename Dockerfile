@@ -11,6 +11,9 @@ RUN mvn --batch-mode --no-transfer-progress dependency:go-offline
 
 COPY scanner-service/src ./src
 RUN mvn --batch-mode --no-transfer-progress -DskipTests package
+# Run the fast unit tests here so Surefire's test-execution provider jars land in the
+# cached ~/.m2. Otherwise the runtime's first "mvn test" would hang trying to fetch them.
+RUN mvn --batch-mode --no-transfer-progress -DforkCount=0 -Dtest='!*IntegrationTest' -DfailIfNoTests=false test
 
 # JDK (not JRE) base so Gate 1's "mvn test" check can compile & run tests in-process.
 FROM eclipse-temurin:17-jdk-jammy AS runtime
