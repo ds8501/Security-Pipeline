@@ -39,7 +39,9 @@ RUN set -eux; \
 WORKDIR /app
 COPY --from=build /workspace/scanner-service/target/scanner-service-*.jar /app/app.jar
 
-ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75.0 -Djava.security.egd=file:/dev/./urandom"
+# Cap the JVM heap at ~40% so Gate 1's tool subprocesses (Semgrep etc.) have room
+# on a 512MB host. Tools run sequentially, so peak = heap + one tool at a time.
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=40.0 -Djava.security.egd=file:/dev/./urandom"
 EXPOSE 8080
 
 # Render supplies PORT at runtime. The fallback keeps local Docker usage simple.
