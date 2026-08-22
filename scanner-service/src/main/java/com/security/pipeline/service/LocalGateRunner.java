@@ -2,7 +2,10 @@ package com.security.pipeline.service;
 
 import com.security.pipeline.entity.Gate1Check;
 import com.security.pipeline.entity.Gate1Run;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -23,6 +26,12 @@ public class LocalGateRunner {
     private record Tool(String name, List<String> command, boolean atRepoRoot, int timeoutSeconds) {
     }
 
+    // Heavy tools (mvn test + Trivy) are off by default so Gate 1 stays fast and responsive on
+    // small hosts (e.g. Render free tier). Set secgate.gate1.heavy-tools=true on a bigger instance
+    // to run the full suite.
+    @Value("${secgate.gate1.heavy-tools:false}")
+    private boolean heavyTools;
+
     public void run(Gate1Run gate) {
         Path root = null;
         try {
@@ -38,20 +47,24 @@ public class LocalGateRunner {
             }
 
             Path pom = findPom(repoDir);
-            List<Tool> tools = List.of(
-                    // generous timeout: the first wrapper run downloads Maven and all dependencies
-                    new Tool("Unit tests & coverage", mavenCommand(pom), false, 900),
-                    new Tool("Code sanity & crypto (Semgrep)",
-                            List.of("semgrep", "scan", "--error", "--quiet", "--config", "p/security-audit", "."), true, 300),
-                    new Tool("Secret leak (Gitleaks)",
-                            List.of("gitleaks", "detect", "--source", ".", "--no-banner", "--redact"), true, 300),
-                    new Tool("Vulnerable dependencies (osv-scanner)",
-                            List.of("osv-scanner", "scan", "-r", "."), true, 300),
-                    new Tool("Infra & container config (Trivy)",
-                            List.of("trivy", "config", "--quiet", "."), true, 300),
-                    new Tool("SBOM (Syft)",
-                            List.of("syft", "scan", "dir:.", "-o", "cyclonedx-json"), true, 300)
-            );
+            // Fast scanners run always; heavy tools (mvn test, Trivy) only when explicitly enabled.
+            List<Tool> tools = new ArrayList<>();
+            if (heavyTools) {
+                // generous timeout: the first wrapper run downloads Maven and all dependencies
+                tools.add(new Tool("Unit tests & coverage", mavenCommand(pom), false, 900));
+            }
+            tools.add(new Tool("Code sanity & crypto (Semgrep)",
+                    List.of("semgrep", "scan", "--error", "--quiet", "--config", "p/security-audit", "."), true, 300));
+            tools.add(new Tool("Secret leak (Gitleaks)",
+                    List.of("gitleaks", "detect", "--source", ".", "--no-banner", "--redact"), true, 300));
+            tools.add(new Tool("Vulnerable dependencies (osv-scanner)",
+                    List.of("osv-scanner", "scan", "-r", "."), true, 300));
+            if (heavyTools) {
+                tools.add(new Tool("Infra & container config (Trivy)",
+                        List.of("trivy", "config", "--quiet", "."), true, 300));
+            }
+            tools.add(new Tool("SBOM (Syft)",
+                    List.of("syft", "scan", "dir:.", "-o", "cyclonedx-json"), true, 300));
 
             boolean blocked = false;
             for (Tool tool : tools) {
